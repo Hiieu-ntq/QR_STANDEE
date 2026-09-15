@@ -1,0 +1,18 @@
+# ESP-IDF Build Artifacts
+build/
+sdkconfig.old
+dependencies.lock
+managed_components/
+
+# System & Cache
+.cache/
+.DS_Store
+*.tmp
+
+# Local Dumps (Keep source clean)
+full_factory_backup.bin
+flash_dump.bin
+app_factory.bin
+drom.bin
+irom.bin
+irom.asm
