@@ -453,9 +453,11 @@ static void usb_cdc_task(void *pvParameters) {
 
                 for (int i = 0; i < chunk_bytes; i++) {
                     uint8_t b = rx_buf[i];
-                    // Skip trailing control chars (\n, \r, \0, space) right after AT+DTIME=0 command before binary stream data begins
-                    if (stream_buf_offset == 0 && (b == '\n' || b == '\r' || b == '\0' || b == ' ' || b == '\t')) {
-                        continue;
+                    if (stream_skip_whitespace) {
+                        if (b == '\n' || b == '\r') {
+                            continue;
+                        }
+                        stream_skip_whitespace = false;
                     }
                     if (stream_buf_offset < FRAME_BUF_SIZE) {
                         // Swap bytes on-the-fly for Little-Endian RGB565 files to i80 bus:
@@ -479,8 +481,9 @@ static void usb_cdc_task(void *pvParameters) {
                 }
             } else {
                 stream_idle_counter++;
-                // Allow 30s before first 1KB arrived, 10s mid-stream pause
-                int max_idle = (stream_buf_offset < 1024) ? 3000 : 1000;
+                // Allow up to 120s (12000 * 10ms) while user selects file in SSCOM (stream_buf_offset == 0)
+                // Allow 15s mid-stream pause if stream_buf_offset > 0
+                int max_idle = (stream_buf_offset == 0) ? 12000 : 1500;
                 if (stream_idle_counter > max_idle) {
                     if (stream_buf_offset >= (FRAME_BUF_SIZE - 16384)) {
                         ESP_LOGI(TAG, "Nhan gan du %d/%d bytes. Dang render...", (int)stream_buf_offset, FRAME_BUF_SIZE);
