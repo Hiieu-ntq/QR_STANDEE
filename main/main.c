@@ -452,12 +452,17 @@ static void usb_cdc_task(void *pvParameters) {
                 uint8_t *fb_bytes = (uint8_t*)frame_buffer;
 
                 for (int i = 0; i < chunk_bytes; i++) {
+                    uint8_t b = rx_buf[i];
+                    // Skip trailing control chars (\n, \r, \0, space) right after AT+DTIME=0 command before binary stream data begins
+                    if (stream_buf_offset == 0 && (b == '\n' || b == '\r' || b == '\0' || b == ' ' || b == '\t')) {
+                        continue;
+                    }
                     if (stream_buf_offset < FRAME_BUF_SIZE) {
                         // Swap bytes on-the-fly for Little-Endian RGB565 files to i80 bus:
                         if ((stream_buf_offset & 1) == 0) {
-                            fb_bytes[stream_buf_offset + 1] = rx_buf[i];
+                            fb_bytes[stream_buf_offset + 1] = b;
                         } else {
-                            fb_bytes[stream_buf_offset - 1] = rx_buf[i];
+                            fb_bytes[stream_buf_offset - 1] = b;
                         }
                         stream_buf_offset++;
                     }
@@ -469,16 +474,23 @@ static void usb_cdc_task(void *pvParameters) {
                     stream_buf_offset = 0;
                     current_state = STATE_IDLE_BG;
                     ESP_LOGI(TAG, "Full raw frame rendered! State -> IDLE.");
+                    printf("+DTIME: OK\r\n");
+                    fflush(stdout);
                 }
             } else {
                 stream_idle_counter++;
-                // If stream pauses (no data for 2500ms = 250 ticks of 10ms):
-                if (stream_idle_counter > 250) {
+                // Allow 30s before first 1KB arrived, 10s mid-stream pause
+                int max_idle = (stream_buf_offset < 1024) ? 3000 : 1000;
+                if (stream_idle_counter > max_idle) {
                     if (stream_buf_offset >= (FRAME_BUF_SIZE - 16384)) {
                         ESP_LOGI(TAG, "Nhan gan du %d/%d bytes. Dang render...", (int)stream_buf_offset, FRAME_BUF_SIZE);
                         esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
+                        printf("+DTIME: OK (Partial)\r\n");
+                        fflush(stdout);
                     } else if (stream_buf_offset > 0) {
                         ESP_LOGW(TAG, "RAW_STREAM incomplete (%d/%d bytes). Timeout reset.", (int)stream_buf_offset, FRAME_BUF_SIZE);
+                        printf("+DTIME: ERROR (Timeout %d/153600)\r\n", (int)stream_buf_offset);
+                        fflush(stdout);
                     }
                     stream_buf_offset = 0;
                     current_state = STATE_IDLE_BG;
