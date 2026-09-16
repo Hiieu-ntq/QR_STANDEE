@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/select.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -69,14 +71,13 @@ typedef enum {
 static app_state_t current_state = STATE_IDLE_BG;
 static int default_timeout_sec = 30;
 static int current_countdown = 30;
-static char current_qr_payload[256] = "https://vnpt.vn";
+static char current_qr_payload[512] = "https://vnpt.vn";
 
-// Streaming buffer for raw 150KB legacy mode
-#define STREAM_CHUNK_LINES 10
-#define STREAM_CHUNK_BYTES (LCD_H_RES * STREAM_CHUNK_LINES * 2)
-static uint8_t stream_buf[STREAM_CHUNK_BYTES];
+// RAW STREAM mode: nhan toan bo 153600 bytes vao frame_buffer roi render 1 lan
+// Tranh DMA race condition khi dung chunk buffer rieng
 static size_t stream_buf_offset = 0;
-static int stream_current_y = 0;
+// Flag: bo qua byte whitespace thua ngay sau lenh AT+DTIME=0
+static bool stream_skip_whitespace = false;
 
 // Ensure Internal DMA RAM buffer is allocated
 static bool ensure_frame_buffer(void) {
@@ -136,7 +137,7 @@ static void fb_fill_rounded_rect(int x1, int y1, int width, int height, int radi
 
 // Display embedded 240x320 Pure White VNPT background image by copying from Flash to Internal DMA RAM
 static void draw_vnpt_background(void) {
-    ESP_LOGI(TAG, "🖼️ Displaying Official Pure White VNPT Standby Background Image...");
+    ESP_LOGI(TAG, "Displaying Official Pure White VNPT Standby Background Image...");
     if (!ensure_frame_buffer()) return;
     memcpy(frame_buffer, vnpt_bg_pixels, FRAME_BUF_SIZE);
     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
@@ -157,66 +158,41 @@ static const uint8_t font_8x12_digits[10][12] = {
     {0x3E, 0x63, 0x63, 0x63, 0x3E, 0x03, 0x03, 0x06, 0x3C, 0x00, 0x00, 0x00}  // 9
 };
 
-static uint16_t *badge_buf = NULL;
+static void fb_draw_countdown_badge(int seconds) {
+    if (!ensure_frame_buffer()) return;
 
-static void draw_countdown_badge(int seconds) {
     int badge_w = 100;
     int badge_h = 26;
     int badge_x = (LCD_H_RES - badge_w) / 2; // 70
     int badge_y = 282;
 
-    if (!badge_buf) {
-        badge_buf = heap_caps_malloc(badge_w * badge_h * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    }
-    if (!badge_buf) return;
+    fb_fill_rounded_rect(badge_x, badge_y, badge_w, badge_h, 8, COLOR_VNPT_BLUE);
 
-    // 1. Fill dedicated DMA buffer with VNPT Blue
-    for (int i = 0; i < badge_w * badge_h; i++) {
-        badge_buf[i] = COLOR_VNPT_BLUE;
-    }
-
-    // Round badge corners
-    int radius = 8;
-    for (int y = 0; y < badge_h; y++) {
-        for (int x = 0; x < badge_w; x++) {
-            int dx = 0, dy = 0;
-            if (x < radius) dx = radius - x;
-            else if (x >= badge_w - radius) dx = x - (badge_w - radius - 1);
-
-            if (y < radius) dy = radius - y;
-            else if (y >= badge_h - radius) dy = y - (badge_h - radius - 1);
-
-            if (dx * dx + dy * dy > radius * radius) {
-                badge_buf[y * badge_w + x] = COLOR_LIGHT_BG;
-            }
-        }
-    }
-
-    // 2. Render countdown digits into badge_buf
     int tens = (seconds / 10) % 10;
     int ones = seconds % 10;
 
     for (int d = 0; d < 2; d++) {
         int digit = (d == 0) ? tens : ones;
-        int start_x = (d == 0) ? 40 : 52;
-        int start_y = 7;
+        int start_x = badge_x + ((d == 0) ? 40 : 52);
+        int start_y = badge_y + 7;
         const uint8_t *glyph = font_8x12_digits[digit];
         for (int row = 0; row < 12; row++) {
             uint8_t line = glyph[row];
             int py = start_y + row;
             for (int col = 0; col < 8; col++) {
                 int px = start_x + col;
-                if (px < badge_w && py < badge_h) {
+                if (px < LCD_H_RES && py < LCD_V_RES) {
                     if (line & (0x80 >> col)) {
-                        badge_buf[py * badge_w + px] = COLOR_WHITE;
+                        frame_buffer[py * LCD_H_RES + px] = COLOR_WHITE;
                     }
                 }
             }
         }
     }
-
-    // 3. Update ONLY the 100x26 badge region over DMA (Flicker-Free, No Full Screen Refresh!)
-    esp_lcd_panel_draw_bitmap(panel_handle, badge_x, badge_y, badge_x + badge_w, badge_y + badge_h, badge_buf);
+}
+static void draw_countdown_badge(int seconds) {
+    fb_draw_countdown_badge(seconds);
+    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
 }
 
 static uint8_t *qr_code_buf = NULL;
@@ -234,7 +210,7 @@ static bool ensure_qr_buffers(void) {
 
 // Generate & Render QR Code screen into frame_buffer and flush to LCD using Nayuki QR Engine
 static void render_qr_payment_screen(const char *qr_data, int timeout_sec) {
-    ESP_LOGI(TAG, "📲 Rendering Payment QR Screen. Payload: %s, Timeout: %ds", qr_data, timeout_sec);
+    ESP_LOGI(TAG, "Rendering Payment QR Screen. Payload: %s, Timeout: %ds", qr_data, timeout_sec);
 
     if (!ensure_frame_buffer() || !ensure_qr_buffers()) return;
 
@@ -249,26 +225,26 @@ static void render_qr_payment_screen(const char *qr_data, int timeout_sec) {
     uint8_t *tempBuffer = qr_temp_buf;
 
     bool ok = qrcodegen_encodeText(qr_data, tempBuffer, qrcode, qrcodegen_Ecc_QUARTILE,
-                                   qrcodegen_VERSION_MIN, 20,
+                                   qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
                                    qrcodegen_Mask_AUTO, true);
     if (!ok) {
         ok = qrcodegen_encodeText(qr_data, tempBuffer, qrcode, qrcodegen_Ecc_MEDIUM,
-                                   qrcodegen_VERSION_MIN, 20,
+                                   qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
                                    qrcodegen_Mask_AUTO, true);
     }
     if (!ok) {
         ok = qrcodegen_encodeText(qr_data, tempBuffer, qrcode, qrcodegen_Ecc_LOW,
-                                   qrcodegen_VERSION_MIN, 20,
+                                   qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
                                    qrcodegen_Mask_AUTO, true);
     }
 
     if (!ok) {
-        ESP_LOGE(TAG, "Failed to encode QR payload!");
+        ESP_LOGE(TAG, "Failed to encode QR payload: [%s]", qr_data);
         return;
     }
 
     int size = qrcodegen_getSize(qrcode);
-    ESP_LOGI(TAG, "✅ QR generated successfully via Nayuki engine! Size: %dx%d", size, size);
+    ESP_LOGI(TAG, "QR generated successfully! Size: %dx%d", size, size);
 
     // 4. Calculate QR display bounds (MAXIMIZED 216x216 pixels)
     int qr_box_size = 216;
@@ -319,9 +295,9 @@ static void render_qr_payment_screen(const char *qr_data, int timeout_sec) {
         }
     }
 
-    // 6. Draw initial countdown badge inside frame_buffer
+    // 6. Draw initial countdown badge directly inside frame_buffer
     current_countdown = timeout_sec;
-    draw_countdown_badge(current_countdown);
+    fb_draw_countdown_badge(current_countdown);
 
     // 7. Flush entire frame_buffer to LCD in ONE single DMA transaction!
     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
@@ -334,12 +310,15 @@ static void timer_task(void *pvParameters) {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         if (current_state == STATE_QR_DISPLAY) {
-            current_countdown--;
+            // Only count down if timeout is set (> 0). If timeout == 0, stay displayed permanently!
             if (current_countdown > 0) {
-                draw_countdown_badge(current_countdown);
-            } else {
-                ESP_LOGI(TAG, "⏰ Timeout reached. Returning to Official VNPT Standby Background...");
-                draw_vnpt_background();
+                current_countdown--;
+                if (current_countdown > 0) {
+                    draw_countdown_badge(current_countdown);
+                } else {
+                    ESP_LOGI(TAG, "Timeout reached. Returning to Official VNPT Standby Background...");
+                    draw_vnpt_background();
+                }
             }
         }
     }
@@ -347,10 +326,10 @@ static void timer_task(void *pvParameters) {
 
 // AT Command Parser
 static void process_at_command(const char *cmd) {
-    ESP_LOGI(TAG, "📩 Received AT Command: [%s]", cmd);
+    ESP_LOGI(TAG, "Received AT Command: [%s]", cmd);
 
     // Create uppercase version for case-insensitive matching
-    char upper_cmd[300];
+    char upper_cmd[512];
     size_t len = strlen(cmd);
     if (len >= sizeof(upper_cmd)) len = sizeof(upper_cmd) - 1;
     for (size_t i = 0; i < len; i++) {
@@ -365,40 +344,65 @@ static void process_at_command(const char *cmd) {
     const char *ver_ptr = strstr(upper_cmd, "AT+VER");
 
     if (qr_ptr) {
-        char payload[256] = {0};
-        int timeout = default_timeout_sec;
         const char *orig_param = cmd + ((qr_ptr - upper_cmd) + 6);
+        char raw[512] = {0};
+        strncpy(raw, orig_param, sizeof(raw) - 1);
 
-        const char *comma = strrchr(orig_param, ',');
-        if (comma && comma > orig_param) {
-            size_t payload_len = comma - orig_param;
-            if (payload_len < sizeof(payload)) {
-                strncpy(payload, orig_param, payload_len);
-                payload[payload_len] = '\0';
-                timeout = atoi(comma + 1);
-                if (timeout <= 0) timeout = 30;
+        // Strip trailing \r, \n, spaces, tabs from raw string
+        size_t rlen = strlen(raw);
+        while (rlen > 0 && (raw[rlen - 1] == '\r' || raw[rlen - 1] == '\n' || raw[rlen - 1] == ' ' || raw[rlen - 1] == '\t')) {
+            raw[--rlen] = '\0';
+        }
+
+        char *p = raw;
+        while (*p == ' ' || *p == '\t') p++;
+
+        char payload[512] = {0};
+        int timeout = default_timeout_sec;
+
+        if (*p == '"') {
+            // Quoted payload: AT+QR="payload",timeout  OR  AT+QR="payload"
+            p++; // Skip opening quote
+            char *close_quote = strrchr(p, '"');
+            if (close_quote) {
+                size_t plen = close_quote - p;
+                if (plen >= sizeof(payload)) plen = sizeof(payload) - 1;
+                strncpy(payload, p, plen);
+                payload[plen] = '\0';
+
+                // Look for comma after closing quote
+                char *comma = strchr(close_quote + 1, ',');
+                if (comma) {
+                    timeout = atoi(comma + 1);
+                }
+            } else {
+                // Missing closing quote, treat entire string as payload
+                strncpy(payload, p, sizeof(payload) - 1);
             }
         } else {
-            strncpy(payload, orig_param, sizeof(payload) - 1);
+            // Unquoted payload: AT+QR=payload,timeout  OR  AT+QR=payload
+            char *comma = strrchr(p, ',');
+            if (comma && comma > p && (comma[1] >= '0' && comma[1] <= '9')) {
+                size_t plen = comma - p;
+                if (plen >= sizeof(payload)) plen = sizeof(payload) - 1;
+                strncpy(payload, p, plen);
+                payload[plen] = '\0';
+                timeout = atoi(comma + 1);
+            } else {
+                strncpy(payload, p, sizeof(payload) - 1);
+            }
         }
 
-        // Strip surrounding quotes if present
-        size_t plen = strlen(payload);
-        if (plen >= 2 && payload[0] == '"' && payload[plen - 1] == '"') {
-            payload[plen - 1] = '\0';
-            memmove(payload, payload + 1, plen - 1);
+        size_t final_len = strlen(payload);
+        if (final_len > 0) {
+            ESP_LOGI(TAG, "Render QR Payload: [%s], Timeout: %ds", payload, timeout);
+            strncpy(current_qr_payload, payload, sizeof(current_qr_payload) - 1);
+            render_qr_payment_screen(current_qr_payload, timeout);
+            printf("+QR: OK\r\n");
+        } else {
+            ESP_LOGW(TAG, "Empty QR payload received!");
+            printf("+QR: ERROR (Empty Payload)\r\n");
         }
-
-        // Strip trailing whitespace / carriage return
-        plen = strlen(payload);
-        while (plen > 0 && (payload[plen - 1] == ' ' || payload[plen - 1] == '\r' || payload[plen - 1] == '\n')) {
-            payload[--plen] = '\0';
-        }
-
-        ESP_LOGI(TAG, "🎯 Render QR Payload: [%s], Timeout: %ds", payload, timeout);
-        strncpy(current_qr_payload, payload, sizeof(current_qr_payload) - 1);
-        render_qr_payment_screen(current_qr_payload, timeout);
-        printf("+QR: OK\r\n");
         fflush(stdout);
     }
     else if (dtime_ptr) {
@@ -406,8 +410,8 @@ static void process_at_command(const char *cmd) {
         if (t == 0) {
             current_state = STATE_RAW_STREAM;
             stream_buf_offset = 0;
-            stream_current_y = 0;
-            ESP_LOGI(TAG, "📥 Switched to RAW_STREAM mode...");
+            stream_skip_whitespace = true; // Bo qua \n thua co the den sau \r
+            ESP_LOGI(TAG, "RAW_STREAM: san sang nhan %d bytes...", FRAME_BUF_SIZE);
         } else {
             default_timeout_sec = t;
         }
@@ -427,33 +431,54 @@ static void process_at_command(const char *cmd) {
 
 // USB Serial Reader Task
 static void usb_cdc_task(void *pvParameters) {
-    char rx_line[300];
+    char rx_line[512];
     size_t rx_idx = 0;
     uint8_t ch;
-    int idle_counter = 0;
 
-    // Set non-blocking mode on stdin (file descriptor 0)
     fcntl(0, F_SETFL, O_NONBLOCK);
 
     while (1) {
         int bytes = read(0, &ch, 1);
         if (bytes > 0) {
-            idle_counter = 0;
             if (current_state == STATE_RAW_STREAM) {
-                stream_buf[stream_buf_offset++] = ch;
-                if (stream_buf_offset >= STREAM_CHUNK_BYTES) {
-                    int next_y = stream_current_y + STREAM_CHUNK_LINES;
-                    if (next_y <= LCD_V_RES) {
-                        esp_lcd_panel_draw_bitmap(panel_handle, 0, stream_current_y, LCD_H_RES, next_y, (uint16_t*)stream_buf);
-                        stream_current_y = next_y;
+                // Bo qua whitespace thua (\n, \r, space) chi o DUNG DAU stream
+                if (stream_skip_whitespace) {
+                    if (ch == '\n' || ch == '\r' || ch == ' ') {
+                        continue;
                     }
-                    stream_buf_offset = 0;
+                    stream_skip_whitespace = false;
+                }
 
-                    if (stream_current_y >= LCD_V_RES) {
-                        ESP_LOGI(TAG, "🎉 Full raw frame rendered!");
-                        stream_current_y = 0;
-                        current_state = STATE_IDLE_BG;
-                    }
+                // Tự động ngắt STATE_RAW_STREAM nếu phát hiện câu lệnh AT đến ('A' / 'a')
+                if (stream_buf_offset == 0 && (ch == 'A' || ch == 'a')) {
+                    ESP_LOGI(TAG, "Phat hien lenh AT trong che do RAW_STREAM! Thuat khoi stream mode.");
+                    current_state = STATE_IDLE_BG;
+                    stream_buf_offset = 0;
+                    rx_idx = 0;
+                    rx_line[rx_idx++] = ch;
+                    continue;
+                }
+
+                if (!ensure_frame_buffer()) {
+                    ESP_LOGE(TAG, "frame_buffer null! Huy stream.");
+                    current_state = STATE_IDLE_BG;
+                    continue;
+                }
+
+                uint8_t *fb_bytes = (uint8_t*)frame_buffer;
+                if ((stream_buf_offset & 1) == 0) {
+                    fb_bytes[stream_buf_offset + 1] = ch;
+                } else {
+                    fb_bytes[stream_buf_offset - 1] = ch;
+                }
+                stream_buf_offset++;
+
+                if (stream_buf_offset >= FRAME_BUF_SIZE) {
+                    ESP_LOGI(TAG, "Nhan du %d bytes. Dang render...", FRAME_BUF_SIZE);
+                    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
+                    stream_buf_offset = 0;
+                    current_state = STATE_IDLE_BG;
+                    ESP_LOGI(TAG, "Full raw frame rendered! State -> IDLE.");
                 }
             } else {
                 if (ch == '\r' || ch == '\n') {
@@ -467,16 +492,7 @@ static void usb_cdc_task(void *pvParameters) {
                 }
             }
         } else {
-            if (rx_idx > 0 && current_state != STATE_RAW_STREAM) {
-                idle_counter++;
-                if (idle_counter > 20) { // 100ms idle timeout auto-triggers AT parser
-                    rx_line[rx_idx] = '\0';
-                    process_at_command(rx_line);
-                    rx_idx = 0;
-                    idle_counter = 0;
-                }
-            }
-            vTaskDelay(pdMS_TO_TICKS(5));
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 }
@@ -486,8 +502,8 @@ void app_main(void) {
     setvbuf(stdin, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    vTaskDelay(pdMS_TO_TICKS(500));
-    ESP_LOGI(TAG, "🚀 Starting F91 VNPT Standby & Payment QR Firmware...");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Starting F91 VNPT Standby & Payment QR Firmware...");
 
     // 1. Initialize Control GPIOs
     gpio_reset_pin(PIN_POWER_42);
@@ -510,7 +526,7 @@ void app_main(void) {
     gpio_set_direction(PIN_BK_LIGHT, GPIO_MODE_OUTPUT);
     gpio_set_level(PIN_BK_LIGHT, 0);
 
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     // 2. Initialize i80 Bus (4MHz for ultra-stable latching)
     esp_lcd_i80_bus_handle_t i80_bus = NULL;
@@ -553,7 +569,7 @@ void app_main(void) {
 
     esp_lcd_panel_reset(panel_handle);
     esp_lcd_panel_init(panel_handle);
-    esp_lcd_panel_invert_color(panel_handle, false); // Hardware invert_color = false for correct white background
+    esp_lcd_panel_invert_color(panel_handle, false);
     esp_lcd_panel_disp_on_off(panel_handle, true);
 
     // Turn backlight ON
@@ -565,11 +581,4 @@ void app_main(void) {
     // 6. Create Tasks
     xTaskCreate(usb_cdc_task, "usb_cdc_task", 8192, NULL, 5, NULL);
     xTaskCreate(timer_task, "timer_task", 4096, NULL, 5, NULL);
-
-    // 7. Auto Demo: Show default VNPT Payment QR code after bootup
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    if (current_state == STATE_IDLE_BG) {
-        ESP_LOGI(TAG, "✨ Bootup Auto Demo: Generating VNPT Payment QR...");
-        render_qr_payment_screen("https://vnpt.vn", 30);
-    }
 }
