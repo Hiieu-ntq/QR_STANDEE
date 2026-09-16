@@ -433,54 +433,63 @@ static void process_at_command(const char *cmd) {
 static void usb_cdc_task(void *pvParameters) {
     char rx_line[512];
     size_t rx_idx = 0;
-    uint8_t ch;
+    uint8_t rx_buf[512];
+    int stream_idle_counter = 0;
 
     fcntl(0, F_SETFL, O_NONBLOCK);
 
     while (1) {
-        int bytes = read(0, &ch, 1);
-        if (bytes > 0) {
-            if (current_state == STATE_RAW_STREAM) {
-                // Bo qua whitespace thua (\n, \r, space) chi o DUNG DAU stream
-                if (stream_skip_whitespace) {
-                    if (ch == '\n' || ch == '\r' || ch == ' ') {
-                        continue;
-                    }
-                    stream_skip_whitespace = false;
-                }
+        if (current_state == STATE_RAW_STREAM) {
+            if (!ensure_frame_buffer()) {
+                ESP_LOGE(TAG, "frame_buffer null! Huy stream.");
+                current_state = STATE_IDLE_BG;
+                continue;
+            }
 
-                // Tự động ngắt STATE_RAW_STREAM nếu phát hiện câu lệnh AT đến ('A' / 'a')
-                if (stream_buf_offset == 0 && (ch == 'A' || ch == 'a')) {
-                    ESP_LOGI(TAG, "Phat hien lenh AT trong che do RAW_STREAM! Thuat khoi stream mode.");
-                    current_state = STATE_IDLE_BG;
-                    stream_buf_offset = 0;
-                    rx_idx = 0;
-                    rx_line[rx_idx++] = ch;
-                    continue;
-                }
-
-                if (!ensure_frame_buffer()) {
-                    ESP_LOGE(TAG, "frame_buffer null! Huy stream.");
-                    current_state = STATE_IDLE_BG;
-                    continue;
-                }
-
+            int chunk_bytes = read(0, rx_buf, sizeof(rx_buf));
+            if (chunk_bytes > 0) {
+                stream_idle_counter = 0;
                 uint8_t *fb_bytes = (uint8_t*)frame_buffer;
-                if ((stream_buf_offset & 1) == 0) {
-                    fb_bytes[stream_buf_offset + 1] = ch;
-                } else {
-                    fb_bytes[stream_buf_offset - 1] = ch;
+
+                for (int i = 0; i < chunk_bytes; i++) {
+                    if (stream_buf_offset < FRAME_BUF_SIZE) {
+                        // Swap bytes on-the-fly for Little-Endian RGB565 files to i80 bus:
+                        if ((stream_buf_offset & 1) == 0) {
+                            fb_bytes[stream_buf_offset + 1] = rx_buf[i];
+                        } else {
+                            fb_bytes[stream_buf_offset - 1] = rx_buf[i];
+                        }
+                        stream_buf_offset++;
+                    }
                 }
-                stream_buf_offset++;
 
                 if (stream_buf_offset >= FRAME_BUF_SIZE) {
-                    ESP_LOGI(TAG, "Nhan du %d bytes. Dang render...", FRAME_BUF_SIZE);
+                    ESP_LOGI(TAG, "Nhan du %d bytes. Dang render toan bo frame...", FRAME_BUF_SIZE);
                     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
                     stream_buf_offset = 0;
                     current_state = STATE_IDLE_BG;
                     ESP_LOGI(TAG, "Full raw frame rendered! State -> IDLE.");
                 }
             } else {
+                stream_idle_counter++;
+                // If stream pauses (no data for 2500ms = 250 ticks of 10ms):
+                if (stream_idle_counter > 250) {
+                    if (stream_buf_offset >= (FRAME_BUF_SIZE - 16384)) {
+                        ESP_LOGI(TAG, "Nhan gan du %d/%d bytes. Dang render...", (int)stream_buf_offset, FRAME_BUF_SIZE);
+                        esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
+                    } else if (stream_buf_offset > 0) {
+                        ESP_LOGW(TAG, "RAW_STREAM incomplete (%d/%d bytes). Timeout reset.", (int)stream_buf_offset, FRAME_BUF_SIZE);
+                    }
+                    stream_buf_offset = 0;
+                    current_state = STATE_IDLE_BG;
+                    stream_idle_counter = 0;
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+        } else {
+            uint8_t ch;
+            int bytes = read(0, &ch, 1);
+            if (bytes > 0) {
                 if (ch == '\r' || ch == '\n') {
                     if (rx_idx > 0) {
                         rx_line[rx_idx] = '\0';
@@ -490,9 +499,9 @@ static void usb_cdc_task(void *pvParameters) {
                 } else if (ch >= 32 && ch != 127 && rx_idx < sizeof(rx_line) - 1) {
                     rx_line[rx_idx++] = ch;
                 }
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(10));
             }
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 }
