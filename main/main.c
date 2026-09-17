@@ -15,6 +15,7 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
 
+#include "esp_flash.h"
 #include "vnpt_bg_data.h"
 #include "vnpt_logo_center.h"
 #include "qrcode.h"
@@ -22,9 +23,11 @@
 
 static const char *TAG = "F91_VNPT_FIRMWARE";
 
-#define LCD_H_RES        240
-#define LCD_V_RES        320
-#define FRAME_BUF_SIZE   (LCD_H_RES * LCD_V_RES * sizeof(uint16_t))
+#define LCD_H_RES               240
+#define LCD_V_RES               320
+#define FRAME_BUF_SIZE          (LCD_H_RES * LCD_V_RES * sizeof(uint16_t))
+#define FLASH_CUSTOM_BG_OFFSET  0x1DA000
+#define FLASH_CUSTOM_BG_ERASE_SIZE 0x26000 // 38 sectors * 4096 = 155648 (sector aligned)
 
 // Pinout mapping for ST7789V 8-bit i80 Parallel LCD
 #define PIN_BK_LIGHT     21
@@ -63,14 +66,19 @@ static uint16_t *frame_buffer = NULL; // Internal DMA-capable RAM buffer
 
 // Device States
 typedef enum {
-    STATE_IDLE_BG,
-    STATE_QR_DISPLAY,
-    STATE_RAW_STREAM
+    STATE_IDLE_BG,             // Hien thi anh nen VNPT mac dinh
+    STATE_IDLE_CUSTOM_BG,      // Hien thi anh nen tho custom (vinh vien)
+    STATE_CUSTOM_BG_COUNTDOWN, // Hien thi anh nen tho custom co dem nguoc (vd 30s)
+    STATE_QR_DISPLAY,          // Hien thi ma QR dem nguoc
+    STATE_RAW_STREAM           // Dang nhan 153600 bytes qua Serial
 } app_state_t;
 
 static app_state_t current_state = STATE_IDLE_BG;
 static int default_timeout_sec = 30;
 static int current_countdown = 30;
+static int custom_bg_countdown = 0;
+static int raw_stream_display_timeout = 0; // Luu timeout hien thi cua lenh AT+DTIME=X
+static bool has_custom_bg = false;          // True neu da nhan anh custom vao frame_buffer
 static char current_qr_payload[512] = "https://vnpt.vn";
 
 // RAW STREAM mode: nhan toan bo 153600 bytes vao frame_buffer roi render 1 lan
@@ -102,9 +110,8 @@ static void fb_fill_rect(int x1, int y1, int width, int height, uint16_t color) 
     if (y2 > LCD_V_RES) y2 = LCD_V_RES;
 
     for (int y = y1; y < y2; y++) {
-        uint16_t *row = &frame_buffer[y * LCD_H_RES];
         for (int x = x1; x < x2; x++) {
-            row[x] = color;
+            frame_buffer[y * LCD_H_RES + x] = color;
         }
     }
 }
@@ -112,69 +119,78 @@ static void fb_fill_rect(int x1, int y1, int width, int height, uint16_t color) 
 // Fill rounded rectangle inside frame_buffer
 static void fb_fill_rounded_rect(int x1, int y1, int width, int height, int radius, uint16_t color) {
     if (!ensure_frame_buffer()) return;
-    int x2 = x1 + width;
-    int y2 = y1 + height;
-    
-    for (int y = y1; y < y2; y++) {
-        if (y < 0 || y >= LCD_V_RES) continue;
-        uint16_t *row = &frame_buffer[y * LCD_H_RES];
-        for (int x = x1; x < x2; x++) {
-            if (x < 0 || x >= LCD_H_RES) continue;
+    int x2 = x1 + width - 1;
+    int y2 = y1 + height - 1;
 
-            int dx = 0, dy = 0;
-            if (x < x1 + radius) dx = (x1 + radius) - x;
-            else if (x >= x2 - radius) dx = x - (x2 - radius - 1);
+    for (int y = y1; y <= y2; y++) {
+        for (int x = x1; x <= x2; x++) {
+            bool draw = true;
+            if (x < x1 + radius && y < y1 + radius) {
+                int dx = x - (x1 + radius);
+                int dy = y - (y1 + radius);
+                if (dx * dx + dy * dy > radius * radius) draw = false;
+            } else if (x > x2 - radius && y < y1 + radius) {
+                int dx = x - (x2 - radius);
+                int dy = y - (y1 + radius);
+                if (dx * dx + dy * dy > radius * radius) draw = false;
+            } else if (x < x1 + radius && y > y2 - radius) {
+                int dx = x - (x1 + radius);
+                int dy = y - (y2 - radius);
+                if (dx * dx + dy * dy > radius * radius) draw = false;
+            } else if (x > x2 - radius && y > y2 - radius) {
+                int dx = x - (x2 - radius);
+                int dy = y - (y2 - radius);
+                if (dx * dx + dy * dy > radius * radius) draw = false;
+            }
 
-            if (y < y1 + radius) dy = (y1 + radius) - y;
-            else if (y >= y2 - radius) dy = y - (y2 - radius - 1);
-
-            if (dx * dx + dy * dy <= radius * radius) {
-                row[x] = color;
+            if (draw && x >= 0 && x < LCD_H_RES && y >= 0 && y < LCD_V_RES) {
+                frame_buffer[y * LCD_H_RES + x] = color;
             }
         }
     }
 }
 
-// Display embedded 240x320 Pure White VNPT background image by copying from Flash to Internal DMA RAM
+// Draw official default VNPT background image to LCD
 static void draw_vnpt_background(void) {
-    ESP_LOGI(TAG, "Displaying Official Pure White VNPT Standby Background Image...");
     if (!ensure_frame_buffer()) return;
     memcpy(frame_buffer, vnpt_bg_pixels, FRAME_BUF_SIZE);
     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
     current_state = STATE_IDLE_BG;
+    has_custom_bg = false;
+    ESP_LOGI(TAG, "Displaying Official Pure White VNPT Standby Background Image...");
 }
 
-// 8x12 ASCII font for digits
+// 8x12 Font Digits Bitmap ('0'-'9')
 static const uint8_t font_8x12_digits[10][12] = {
-    {0x3E, 0x63, 0x67, 0x6F, 0x7B, 0x73, 0x63, 0x63, 0x3E, 0x00, 0x00, 0x00}, // 0
-    {0x0C, 0x1C, 0x3C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x3E, 0x00, 0x00, 0x00}, // 1
-    {0x3E, 0x63, 0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7F, 0x00, 0x00, 0x00}, // 2
-    {0x3E, 0x63, 0x03, 0x03, 0x1E, 0x03, 0x03, 0x63, 0x3E, 0x00, 0x00, 0x00}, // 3
-    {0x06, 0x0E, 0x1E, 0x36, 0x66, 0x7F, 0x06, 0x06, 0x0F, 0x00, 0x00, 0x00}, // 4
-    {0x7F, 0x60, 0x60, 0x7C, 0x03, 0x03, 0x03, 0x63, 0x3E, 0x00, 0x00, 0x00}, // 5
-    {0x1C, 0x30, 0x60, 0x60, 0x7C, 0x63, 0x63, 0x63, 0x3E, 0x00, 0x00, 0x00}, // 6
-    {0x7F, 0x63, 0x03, 0x06, 0x0C, 0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x00}, // 7
-    {0x3E, 0x63, 0x63, 0x63, 0x3E, 0x63, 0x63, 0x63, 0x3E, 0x00, 0x00, 0x00}, // 8
-    {0x3E, 0x63, 0x63, 0x63, 0x3E, 0x03, 0x03, 0x06, 0x3C, 0x00, 0x00, 0x00}  // 9
+    {0x3C,0x66,0x66,0x6E,0x76,0x66,0x66,0x66,0x66,0x66,0x3C,0x00}, // 0
+    {0x18,0x38,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x7E,0x00}, // 1
+    {0x3C,0x66,0x06,0x06,0x0C,0x18,0x30,0x60,0x60,0x66,0x7E,0x00}, // 2
+    {0x3C,0x66,0x06,0x06,0x1C,0x06,0x06,0x06,0x06,0x66,0x3C,0x00}, // 3
+    {0x0C,0x1C,0x3C,0x6C,0xCC,0xFE,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, // 4
+    {0x7E,0x60,0x60,0x60,0x7C,0x06,0x06,0x06,0x06,0x66,0x3C,0x00}, // 5
+    {0x3C,0x66,0x60,0x60,0x7C,0x66,0x66,0x66,0x66,0x66,0x3C,0x00}, // 6
+    {0x7E,0x66,0x06,0x0C,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x00}, // 7
+    {0x3C,0x66,0x66,0x66,0x3C,0x66,0x66,0x66,0x66,0x66,0x3C,0x00}, // 8
+    {0x3C,0x66,0x66,0x66,0x3E,0x06,0x06,0x06,0x06,0x66,0x3C,0x00}  // 9
 };
 
+// Draw countdown badge overlay onto frame_buffer
 static void fb_draw_countdown_badge(int seconds) {
     if (!ensure_frame_buffer()) return;
-
-    int badge_w = 100;
-    int badge_h = 26;
-    int badge_x = (LCD_H_RES - badge_w) / 2; // 70
+    int badge_w = 68;
+    int badge_h = 24;
+    int badge_x = (LCD_H_RES - badge_w) / 2;
     int badge_y = 282;
 
-    fb_fill_rounded_rect(badge_x, badge_y, badge_w, badge_h, 8, COLOR_VNPT_BLUE);
+    fb_fill_rounded_rect(badge_x, badge_y, badge_w, badge_h, 6, COLOR_RED);
 
     int tens = (seconds / 10) % 10;
     int ones = seconds % 10;
 
     for (int d = 0; d < 2; d++) {
         int digit = (d == 0) ? tens : ones;
-        int start_x = badge_x + ((d == 0) ? 40 : 52);
-        int start_y = badge_y + 7;
+        int start_x = badge_x + ((d == 0) ? 18 : 36);
+        int start_y = badge_y + 6;
         const uint8_t *glyph = font_8x12_digits[digit];
         for (int row = 0; row < 12; row++) {
             uint8_t line = glyph[row];
@@ -305,7 +321,7 @@ static void render_qr_payment_screen(const char *qr_data, int timeout_sec) {
     current_state = STATE_QR_DISPLAY;
 }
 
-// Timer Task for Countdown & Auto-Reset to VNPT Standby Background
+// Timer Task for Countdown & Auto-Reset to Standby Background
 static void timer_task(void *pvParameters) {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -316,7 +332,27 @@ static void timer_task(void *pvParameters) {
                 if (current_countdown > 0) {
                     draw_countdown_badge(current_countdown);
                 } else {
-                    ESP_LOGI(TAG, "Timeout reached. Returning to Official VNPT Standby Background...");
+                    if (has_custom_bg) {
+                        ESP_LOGI(TAG, "QR Timeout reached (0s). Restoring Custom Raw Background from Flash...");
+                        esp_err_t rerr = esp_flash_read(NULL, frame_buffer, FLASH_CUSTOM_BG_OFFSET, FRAME_BUF_SIZE);
+                        if (rerr == ESP_OK) {
+                            esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
+                            current_state = STATE_IDLE_CUSTOM_BG;
+                        } else {
+                            ESP_LOGE(TAG, "Failed to read custom background from Flash! Returning to VNPT BG.");
+                            draw_vnpt_background();
+                        }
+                    } else {
+                        ESP_LOGI(TAG, "QR Timeout reached. Returning to Official VNPT Standby Background...");
+                        draw_vnpt_background();
+                    }
+                }
+            }
+        } else if (current_state == STATE_CUSTOM_BG_COUNTDOWN) {
+            if (custom_bg_countdown > 0) {
+                custom_bg_countdown--;
+                if (custom_bg_countdown <= 0) {
+                    ESP_LOGI(TAG, "Custom Raw Background timeout (%ds) reached. Returning to Official VNPT Background...", raw_stream_display_timeout);
                     draw_vnpt_background();
                 }
             }
@@ -407,14 +443,11 @@ static void process_at_command(const char *cmd) {
     }
     else if (dtime_ptr) {
         int t = atoi(dtime_ptr + 9);
-        if (t == 0) {
-            current_state = STATE_RAW_STREAM;
-            stream_buf_offset = 0;
-            stream_skip_whitespace = true; // Bo qua \n thua co the den sau \r
-            ESP_LOGI(TAG, "RAW_STREAM: san sang nhan %d bytes...", FRAME_BUF_SIZE);
-        } else {
-            default_timeout_sec = t;
-        }
+        raw_stream_display_timeout = t;
+        current_state = STATE_RAW_STREAM;
+        stream_buf_offset = 0;
+        stream_skip_whitespace = true; // Bo qua \n thua co the den sau \r
+        ESP_LOGI(TAG, "RAW_STREAM: san sang nhan %d bytes (Display timeout: %ds)...", FRAME_BUF_SIZE, raw_stream_display_timeout);
         printf("OK\r\n");
         fflush(stdout);
     }
@@ -474,8 +507,26 @@ static void usb_cdc_task(void *pvParameters) {
                     ESP_LOGI(TAG, "Nhan du %d bytes. Dang render toan bo frame...", FRAME_BUF_SIZE);
                     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
                     stream_buf_offset = 0;
-                    current_state = STATE_IDLE_BG;
-                    ESP_LOGI(TAG, "Full raw frame rendered! State -> IDLE.");
+                    has_custom_bg = true;
+
+                    // Erase & Save custom background to Flash offset 0x1DA000 (38 sectors = 0x26000)
+                    ESP_LOGI(TAG, "Saving custom background to Flash offset 0x%X (erase size: 0x%X)...", FLASH_CUSTOM_BG_OFFSET, FLASH_CUSTOM_BG_ERASE_SIZE);
+                    esp_err_t err1 = esp_flash_erase_region(NULL, FLASH_CUSTOM_BG_OFFSET, FLASH_CUSTOM_BG_ERASE_SIZE);
+                    esp_err_t err2 = esp_flash_write(NULL, frame_buffer, FLASH_CUSTOM_BG_OFFSET, FRAME_BUF_SIZE);
+                    if (err1 == ESP_OK && err2 == ESP_OK) {
+                        ESP_LOGI(TAG, "Custom background saved to Flash successfully!");
+                    } else {
+                        ESP_LOGE(TAG, "Failed to save custom background to Flash (erase: 0x%x, write: 0x%x)", err1, err2);
+                    }
+
+                    if (raw_stream_display_timeout > 0) {
+                        custom_bg_countdown = raw_stream_display_timeout;
+                        current_state = STATE_CUSTOM_BG_COUNTDOWN;
+                        ESP_LOGI(TAG, "Custom raw background rendered! Active for %ds before returning to VNPT BG.", custom_bg_countdown);
+                    } else {
+                        current_state = STATE_IDLE_CUSTOM_BG;
+                        ESP_LOGI(TAG, "Custom raw background set permanently (State -> IDLE_CUSTOM_BG).");
+                    }
                     printf("+DTIME: OK\r\n");
                     fflush(stdout);
                 }
@@ -605,4 +656,5 @@ void app_main(void) {
     // 6. Create Tasks
     xTaskCreate(usb_cdc_task, "usb_cdc_task", 8192, NULL, 5, NULL);
     xTaskCreate(timer_task, "timer_task", 4096, NULL, 5, NULL);
+    ESP_LOGI(TAG, "Free Heap: %u bytes, Min Free Heap: %u bytes", (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
 }
