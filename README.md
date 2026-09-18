@@ -1,4 +1,4 @@
-# F91 VNPT Standee Firmware v2.3 (ESP32-S2 + ST7789 8-bit Parallel)
+# F91 VNPT Standee Firmware v1.0 (ESP32-S2 + ST7789 8-bit Parallel)
 
 Firmware điều khiển hiển thị và giao tiếp cho thiết bị **F91 VNPT Standee / Loa Thanh Toán Thông Minh** trên nền tảng vi điều khiển **ESP32-S2** và màn hình **ST7789** chuẩn giao tiếp song song 8-bit Intel 8080 ($240 \times 320$ pixel).
 
@@ -7,9 +7,9 @@ Firmware điều khiển hiển thị và giao tiếp cho thiết bị **F91 VNP
 ##  Tính Năng Chính
 
 * **Màn hình chờ thương hiệu VNPT HD**: Nền trắng tinh khiết chuẩn $240 \times 320$ pixel với logo VNPT sắc nét, không viền rác.
-* **Bộ sinh mã QR động Nayuki ISO/IEC 18004**: Tự động tạo mã QR chất lượng cao (ECC Quartile/Medium) theo nội dung thanh toán gửi từ máy tính/POS, tích hợp logo VNPT ($36 \times 36$) ở tâm mã QR có **bo tròn 4 góc ($R=6\text{px}$)**.
+* **Bộ sinh mã QR động Nayuki ISO/IEC 18004**: Tự động tạo mã QR chất lượng cao (ECC Quartile/Medium/Low) theo nội dung thanh toán gửi từ máy tính/POS, tích hợp logo VNPT ($36 \times 36$) ở tâm mã QR có **bo tròn 4 góc ($R=6\text{px}$)**.
 * **Thanh Hướng Dẫn Banner Xanh**: Dải màu xanh VNPT trên cùng hiển thị dòng chữ trắng hướng dẫn **`QUET MA DE THANH TOAN`**.
-* **Huy hiệu đếm ngược thời gian (Countdown Badge)**: Đếm lùi thời gian thực (30s, 29s, ..., 1s), tự động đóng mã QR và quay về màn hình chờ khi hết hạn. Được đồng bộ bằng FreeRTOS Mutex, không bị kẹt hay giật lag.
+* **Huy hiệu đếm ngược thời gian (Countdown Badge)**: Đếm lùi thời gian thực (30s, 29s, ..., 1s), tự động đóng mã QR và quay về màn hình chờ khi hết hạn.
 * **Tích hợp Web Config & Captive Portal Tự Động**: 
   * Phát Wi-Fi SoftAP tên `ESP32_WiFi_Setup` (Mật khẩu: `12345678`).
   * Tự động nảy trang Web Cấu hình VNPT (`http://192.168.4.1`) trên điện thoại iOS / Android.
@@ -17,7 +17,6 @@ Firmware điều khiển hiển thị và giao tiếp cho thiết bị **F91 VNP
   * Tự động tắt phát sóng SoftAP chuyển về chế độ Pure STA khi đã có Internet để tiết kiệm điện và chống nhiễu.
 * **Hỗ trợ Cấu Hình IP Tĩnh (Static IP)**: Cấu hình qua Web UI hoặc lệnh AT `AT+STATICIP=`.
 * **Hỗ trợ nạp luồng ảnh thô 150KB Zero-Copy (`AT+DTIME`)**: Nhận trực tiếp ảnh $240 \times 320$ RGB565 qua USB CDC và vẽ trực tiếp vào LCD, không tốn RAM hệ thống.
-* **Giao diện dòng lệnh AT Command chuẩn hoá**: Tự động Echo ký tự khi gõ/paste (hỗ trợ phím Backspace, Terminal VS Code, SSCOM, PuTTY, v.v.).
 
 ---
 
@@ -27,20 +26,18 @@ Mọi lệnh AT được gửi qua cổng USB Serial CDC (Baudrate: `115200`, k�
 
 | STT | Câu lệnh AT | Cú pháp & Ví dụ | Mô tả chi tiết | Phản hồi từ thiết bị |
 | :---: | :--- | :--- | :--- | :--- |
-| **1** | `AT` | `AT` | Kiểm tra kết nối Serial giữa máy tính/POS và thiết bị. | `OK` |
-| **2** | `AT+VER` | `AT+VER` | Lấy thông tin phiên bản firmware đang chạy. | `+VER: F91_VNPT_STANDEE_V2.3`<br>`OK` |
-| **3** | `ATE1` | `ATE1` | Bật chế độ Serial Echo (Mặc định). Ký tự khi gõ hoặc paste vào terminal sẽ hiển thị thời gian thực. Hỗ trợ phím Backspace. | `OK` |
-| **4** | `ATE0` | `ATE0` | Tắt chế độ Serial Echo. Dành cho các phần mềm POS/máy tự động giao tiếp không muốn nhận lại chuỗi gửi. | `OK` |
-| **5** | `AT+QR` | `AT+QR=https://vnpt.vn,30`<br>`AT+QR="https://youtube.com",45` | Sinh và hiển thị mã QR thanh toán.<br>- Tham số 1: Nội dung mã QR.<br>- Tham số 2: Thời gian đếm ngược (giây). | `+QR: OK`<br>*(hoặc `+QR: ERROR` nếu chuỗi rỗng)* |
-| **6** | `AT+QR_DISPLAY` | `AT+QR_DISPLAY=30,https://vnpt.vn` | Lệnh hiển thị mã QR theo chuẩn gốc F91 Hemipay (tương thích ngược hoàn toàn).<br>- Tham số 1: Thời gian đếm ngược (giây).<br>- Tham số 2: Nội dung mã QR. | `+QR_DISPLAY: OK` |
-| **7** | `AT+BG`<br>`AT+CLEAR` | `AT+BG`<br>`AT+CLEAR`<br>`AT+DISPLAY_CLEAR` | Quay về màn hình chờ VNPT ngay lập tức. Xóa sạch mọi mã QR và hủy bỏ hoàn toàn tác vụ đếm ngược. | `OK` |
+| **1** | `AT+VER` | `AT+VER` | Lấy thông tin phiên bản firmware đang chạy. | `+VER: F91_VNPT_STANDEE_V1.0`<br>`OK` |
+| **2** | `AT+WIFI` | `AT+WIFI="SSID","PASSWORD"`<br>`AT+WIFI=MySSID,MyPassword` | Cấu hình và kết nối ngay tới mạng Wi-Fi.<br>- Tham số 1: Tên Wi-Fi (SSID).<br>- Tham số 2: Mật khẩu (Password). | `+WIFI: CONNECTING...`<br>*(Sau đó: `+WIFI: CONNECTED, IP=x.x.x.x, INTERNET=OK` hoặc `FAIL`)* |
+| **3** | `AT+WIFISTATUS` | `AT+WIFISTATUS` | Xem trạng thái kết nối Wi-Fi & Địa chỉ IP hiện tại. | `+WIFISTATUS: CONNECTED_GOT_INTERNET, IP=192.168.1.50`<br>`OK` |
+| **4** | `AT+PING` | `AT+PING` | Kiểm tra khả năng truy cập Internet thực tế (ping Google/Cloudflare DNS). | `+PING: CHECKING INTERNET...`<br>`+PING: INTERNET OK (Google/Cloudflare reached)`<br>`OK` |
+| **5** | `AT+STATICIP` | `AT+STATICIP=1,"192.168.1.100","255.255.255.0","192.168.1.1","8.8.8.8"`<br>`AT+STATICIP=0` | Cấu hình IP Tĩnh (Static IP) hoặc quay về DHCP động.<br>- Tham số 1: `1` (bật static IP) / `0` (dùng DHCP).<br>- Tham số 2..5: IP, Netmask, Gateway, DNS. | `+STATICIP: ENABLED, IP=192.168.1.100, GW=192.168.1.1, DNS=8.8.8.8`<br>`OK` |
+| **6** | `AT+QR` | `AT+QR=https://vnpt.vn,30`<br>`AT+QR="https://vnpt.vn",45` | Sinh và hiển thị mã QR thanh toán.<br>- Tham số 1: Nội dung mã QR.<br>- Tham số 2: Thời gian đếm ngược (giây). | `+QR: OK`<br>*(hoặc `+QR: ERROR (Empty Payload)`)* |
+| **7** | `AT+BG`<br>`AT+CLEAR` | `AT+BG`<br>`AT+CLEAR` | Quay về màn hình chờ VNPT ngay lập tức. Xóa sạch mọi mã QR và hủy bỏ hoàn toàn tác vụ đếm ngược. | `OK` |
 | **8** | `AT+DTIME=0` | `AT+DTIME=0` | Chuyển sang chế độ nhận luồng ảnh thô 153.600 bytes ($240 \times 320$ RGB565) hiển thị vĩnh viễn trên LCD. | `OK`<br>*(Sau khi nhận đủ 150KB: `+DTIME: OK`)* |
 | **9** | `AT+DTIME=<sec>` | `AT+DTIME=30` | Nhận luồng ảnh thô 153.600 bytes kèm thời gian đếm lùi `<sec>` giây trước khi tự động về màn hình chờ. | `OK`<br>*(Sau khi nhận đủ 150KB: `+DTIME: OK`)* |
-| **10** | `AT+APMODE`<br>`AT+WIFIRESET` | `AT+APMODE`<br>`AT+WIFIRESET` | Xóa sạch cấu hình Wi-Fi trong Flash NVS & RAM driver, bật lại SoftAP `ESP32_WiFi_Setup` và mở Captive Portal cấu hình trên điện thoại. | `+WIFIRESET: ERASING NVS & OPENING SOFTAP...`<br>`OK` |
-| **11** | `AT+WIFISTATUS` | `AT+WIFISTATUS` | Xem trạng thái Wi-Fi & Internet hiện tại, địa chỉ IP được cấp, SSID và kết quả Ping Internet. | `+WIFISTATUS: CONNECTED, IP: 192.168.1.50, INTERNET: ONLINE`<br>`OK` |
-| **12** | `AT+STATICIP` | `AT+STATICIP=1,"192.168.1.100","255.255.255.0","192.168.1.1","8.8.8.8"`<br>`AT+STATICIP=0` | Cấu hình IP Tĩnh (Static IP) hoặc quay về DHCP động.<br>- Tham số 1: `1` (bật) / `0` (tắt DHCP).<br>- Tham số 2..5: IP, Netmask, Gateway, DNS. | `+STATICIP: ENABLED (192.168.1.100)`<br>`OK` |
-| **13** | `AT+WIFIRESTART` | `AT+WIFIRESTART` | Ngắt và kết nối lại mạng Wi-Fi đã lưu trong Flash NVS. | `+WIFIRESTART: RESTARTING...`<br>`OK` |
-| **14** | `AT+RST` | `AT+RST`<br>`AT+RESTART` | Khởi động lại vi điều khiển ESP32-S2. | `+RST: REBOOTING HARDWARE...`<br>`OK` |
+| **10** | `AT+APMODE`<br>`AT+WIFIRESET` | `AT+APMODE`<br>`AT+WIFIRESET` | Xóa sạch cấu hình Wi-Fi trong Flash NVS, bật lại SoftAP `ESP32_WiFi_Setup` và mở Captive Portal cấu hình trên điện thoại. | `+WIFIRESET: ERASING NVS & OPENING SOFTAP "ESP32_WiFi_Setup"...`<br>`OK` |
+| **11** | `AT+WIFIRESTART`<br>`AT+WIFIRST` | `AT+WIFIRESTART` | Khởi động lại trình quản lý Wi-Fi và thử kết nối lại mạng đã lưu. | `+WIFIRESTART: RESTARTING...`<br>`OK` |
+| **12** | `AT+RST`<br>`AT+RESTART` | `AT+RST`<br>`AT+RESTART` | Khởi động lại vi điều khiển ESP32-S2. | `+RST: REBOOTING HARDWARE...`<br>`OK` |
 
 ---
 
@@ -51,23 +48,23 @@ Thiết bị sử dụng chip ESP32-S2 điều khiển màn hình ST7789 240x320
 ### 1. Đường Dữ Liệu 8-bit (Data Bus D0 - D7)
 | ST7789 Data Pin | ESP32-S2 GPIO |
 | :---: | :---: |
-| D0 | GPIO 33 |
-| D1 | GPIO 34 |
-| D2 | GPIO 35 |
-| D3 | GPIO 36 |
-| D4 | GPIO 37 |
-| D5 | GPIO 38 |
-| D6 | GPIO 9 |
-| D7 | GPIO 10 |
+| D0 | GPIO 10 |
+| D1 | GPIO 9 |
+| D2 | GPIO 8 |
+| D3 | GPIO 7 |
+| D4 | GPIO 6 |
+| D5 | GPIO 5 |
+| D6 | GPIO 3 |
+| D7 | GPIO 2 |
 
 ### 2. Đường Điều Khiển Bus (Control Pins)
 | Chân tín hiệu | ESP32-S2 GPIO | Trạng thái tích cực / Chức năng |
 | :--- | :---: | :--- |
-| **CS** (Chip Select) | GPIO 11 | Mức thấp (0) khi truyền lệnh/dữ liệu |
-| **DC / RS** (Data/Command) | GPIO 13 | Mức thấp (0): Command / Mức cao (1): Data |
-| **WR** (Write Enable) | GPIO 12 | Kích sườn xung lên ($0 \rightarrow 1$) để chốt byte |
-| **RST** (Reset) | GPIO 21 | Reset cứng phần cứng ST7789 |
-| **BK_LIGHT** (Backlight) | GPIO 18 | Mức cao (1): Bật đèn nền LED màn hình |
+| **CS** (Chip Select) | GPIO 13 | Mức thấp (0) khi truyền lệnh/dữ liệu |
+| **DC / RS** (Data/Command) | GPIO 12 | Mức thấp (0): Command / Mức cao (1): Data |
+| **WR** (Write Enable) | GPIO 11 | Kích sườn xung lên ($0 \rightarrow 1$) để chốt byte |
+| **RST** (Reset) | GPIO 18 | Reset cứng phần cứng ST7789 |
+| **BK_LIGHT** (Backlight) | GPIO 21 | Mức cao (1): Bật đèn nền LED màn hình |
 
 ### 3. Nguồn & Kích Hoạt Phần Cứng
 | Chức năng | ESP32-S2 GPIO | Mức logic thiết lập |
