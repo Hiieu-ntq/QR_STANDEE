@@ -4,7 +4,7 @@ Firmware điều khiển hiển thị và giao tiếp cho thiết bị **F91 VNP
 
 ---
 
-## 🌟 Tính Năng Nổi Bật
+##  Tính Năng Chính
 
 * **Màn hình chờ thương hiệu VNPT HD**: Nền trắng tinh khiết chuẩn $240 \times 320$ pixel với logo VNPT sắc nét, không viền rác.
 * **Bộ sinh mã QR động Nayuki ISO/IEC 18004**: Tự động tạo mã QR chất lượng cao (ECC Quartile/Medium) theo nội dung thanh toán gửi từ máy tính/POS, tích hợp logo VNPT ($36 \times 36$) ở tâm mã QR có **bo tròn 4 góc ($R=6\text{px}$)**.
@@ -21,7 +21,7 @@ Firmware điều khiển hiển thị và giao tiếp cho thiết bị **F91 VNP
 
 ---
 
-## 📋 Bảng Tập Lệnh Serial AT Commands Chi Tiết
+## Bảng Tập Lệnh Serial AT Commands Chi Tiết
 
 Mọi lệnh AT được gửi qua cổng USB Serial CDC (Baudrate: `115200`, kết thúc bằng `\r\n` hoặc `\n`).
 
@@ -44,7 +44,7 @@ Mọi lệnh AT được gửi qua cổng USB Serial CDC (Baudrate: `115200`, k�
 
 ---
 
-## 🔌 Sơ Đồ Chân Phần Cứng (Hardware Pinout)
+##  Sơ Đồ Chân Phần Cứng (Hardware Pinout)
 
 Thiết bị sử dụng chip ESP32-S2 điều khiển màn hình ST7789 240x320 qua bus vi xử lý 8-bit Intel 8080:
 
@@ -78,7 +78,7 @@ Thiết bị sử dụng chip ESP32-S2 điều khiển màn hình ST7789 240x320
 
 ---
 
-## 🚀 Hướng Dẫn Biên Dịch & Nạp Firmware Trên Windows
+##  Hướng Dẫn Biên Dịch & Nạp Firmware Trên Windows
 
 ### 1. Môi Trường ESP-IDF Trên Windows
 Mở **ESP-IDF PowerShell** hoặc **ESP-IDF Command Prompt** (được tạo tự động sau khi cài ESP-IDF trên Windows).
@@ -114,7 +114,7 @@ python -m esptool --chip esp32s2 -p COM3 -b 460800 write_flash 0x1000 build/boot
 
 ---
 
-## 💻 Hướng Dẫn Gửi Lệnh AT Trên Windows
+##  Hướng Dẫn Gửi Lệnh AT Trên Windows
 
 ### Cách 1: Dùng PowerShell (Windows Terminal)
 Mở PowerShell và gửi lệnh AT trực tiếp tới cổng COM (Ví dụ: `COM3`):
@@ -149,7 +149,7 @@ $port.Close()
 
 ---
 
-## 🖼️ Hướng Dẫn Nạp Ảnh Thô (Raw RGB565 Image Upload)
+##  Hướng Dẫn Nạp Ảnh Thô (Raw RGB565 Image Upload)
 
 Chế độ ảnh thô cho phép hiển thị hình ảnh poster quảng cáo tùy biến trực tiếp lên màn hình $240 \times 320$.
 
@@ -183,7 +183,7 @@ python send_image.py poster.png -p COM3 -t 30
 
 ---
 
-## 🌐 Hướng Dẫn Cấu Hình Wi-Fi Qua Web Config (Captive Portal)
+## Hướng Dẫn Cấu Hình Wi-Fi Qua Web Config (Captive Portal)
 
 1. **Gửi lệnh kích hoạt Web Config**: Gửi lệnh `AT+APMODE` hoặc `AT+WIFIRESET` từ máy tính/POS.
 2. **Kết nối Wi-Fi trên Điện thoại / Máy tính**:
@@ -196,5 +196,5 @@ python send_image.py poster.png -p COM3 -t 30
 
 ---
 
-## 📄 Giấy Phép (License)
+##  Giấy Phép (License)
 Phát triển bởi VNPT Standee Payment Firmware Team © 2026. Tất cả các quyền được bảo hộ.
