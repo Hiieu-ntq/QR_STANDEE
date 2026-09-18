@@ -7,6 +7,7 @@
 #include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "driver/gpio.h"
@@ -20,12 +21,16 @@
 #include "vnpt_logo_center.h"
 #include "qrcode.h"
 #include "qrcodegen.h"
+#include "wifi_manager.h"
+#include "internet_check.h"
 
 static const char *TAG = "F91_VNPT_FIRMWARE";
 
 #define LCD_H_RES               240
 #define LCD_V_RES               320
-#define FRAME_BUF_SIZE          (LCD_H_RES * LCD_V_RES * sizeof(uint16_t))
+#define TILE_HEIGHT             32
+#define FRAME_BUF_SIZE          (LCD_H_RES * TILE_HEIGHT * sizeof(uint16_t)) // 240 * 32 * 2 = 15,360 bytes (15.3 KB)
+#define FULL_FRAME_SIZE         (LCD_H_RES * LCD_V_RES * sizeof(uint16_t))
 #define FLASH_CUSTOM_BG_OFFSET  0x1DA000
 #define FLASH_CUSTOM_BG_ERASE_SIZE 0x26000 // 38 sectors * 4096 = 155648 (sector aligned)
 
@@ -45,7 +50,9 @@ static const int data_pins[8] = {10, 9, 8, 7, 6, 5, 3, 2};
 
 // Global handles & buffers
 static esp_lcd_panel_handle_t panel_handle = NULL;
-static uint16_t *frame_buffer = NULL; // Internal DMA-capable RAM buffer
+static uint16_t *frame_buffer = NULL; // 15.3 KB DMA-capable Tile Buffer
+static uint16_t badge_buffer[68 * 24]; // Dedicated 3.2 KB buffer for countdown badge (stride 68)
+static SemaphoreHandle_t lcd_trans_sem = NULL;
 
 // Helper macro: Convert RGB to 16-bit i80 bus format (HighByte first, then LowByte)
 #define MAKE_COLOR(r, g, b) ({ \
@@ -77,29 +84,48 @@ static app_state_t current_state = STATE_IDLE_BG;
 static int default_timeout_sec = 30;
 static int current_countdown = 30;
 static int custom_bg_countdown = 0;
-static int raw_stream_display_timeout = 0; // Luu timeout hien thi cua lenh AT+DTIME=X
-static bool has_custom_bg = false;          // True neu da nhan anh custom vao frame_buffer
+static int raw_stream_display_timeout = 0;
+static bool has_custom_bg = false;
 static char current_qr_payload[512] = "https://vnpt.vn";
 
-// RAW STREAM mode: nhan toan bo 153600 bytes vao frame_buffer roi render 1 lan
-// Tranh DMA race condition khi dung chunk buffer rieng
+// Forward declaration
+static void render_qr_payment_screen(const char *qr_data, int timeout_sec);
+
+// RAW STREAM mode tracking (10 tiles x 15360 bytes = 153600 bytes)
 static size_t stream_buf_offset = 0;
-// Flag: bo qua byte whitespace thua ngay sau lenh AT+DTIME=0
+static int stream_tile_index = 0;
 static bool stream_skip_whitespace = false;
 
-// Ensure Internal DMA RAM buffer is allocated
+// Synchronous LCD Draw Bitmap using DMA Done ISR Semaphore
+static bool IRAM_ATTR lcd_on_trans_done(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx) {
+    BaseType_t high_task_awoken = pdFALSE;
+    if (lcd_trans_sem) {
+        xSemaphoreGiveFromISR(lcd_trans_sem, &high_task_awoken);
+    }
+    return high_task_awoken == pdTRUE;
+}
+
+static void draw_bitmap_sync(int x_start, int y_start, int x_end, int y_end, const void *color_data) {
+    esp_lcd_panel_draw_bitmap(panel_handle, x_start, y_start, x_end, y_end, color_data);
+    if (lcd_trans_sem) {
+        xSemaphoreTake(lcd_trans_sem, portMAX_DELAY);
+    }
+}
+
+// Ensure Internal DMA RAM tile buffer is allocated (15.3 KB)
 static bool ensure_frame_buffer(void) {
     if (!frame_buffer) {
         frame_buffer = heap_caps_malloc(FRAME_BUF_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
         if (!frame_buffer) {
-            ESP_LOGE(TAG, "Failed to allocate DMA internal RAM frame buffer!");
+            ESP_LOGE(TAG, "Failed to allocate DMA tile buffer (%d bytes)!", (int)FRAME_BUF_SIZE);
             return false;
         }
+        ESP_LOGI(TAG, "Successfully allocated 15.3KB DMA Tile Buffer!");
     }
     return true;
 }
 
-// Fill rectangle inside frame_buffer
+// Fill rectangle inside tile/region
 static void fb_fill_rect(int x1, int y1, int width, int height, uint16_t color) {
     if (!ensure_frame_buffer()) return;
     int x2 = x1 + width;
@@ -107,7 +133,7 @@ static void fb_fill_rect(int x1, int y1, int width, int height, uint16_t color) 
     if (x1 < 0) x1 = 0;
     if (y1 < 0) y1 = 0;
     if (x2 > LCD_H_RES) x2 = LCD_H_RES;
-    if (y2 > LCD_V_RES) y2 = LCD_V_RES;
+    if (y2 > TILE_HEIGHT) y2 = TILE_HEIGHT;
 
     for (int y = y1; y < y2; y++) {
         for (int x = x1; x < x2; x++) {
@@ -116,7 +142,7 @@ static void fb_fill_rect(int x1, int y1, int width, int height, uint16_t color) 
     }
 }
 
-// Fill rounded rectangle inside frame_buffer
+// Fill rounded rectangle inside tile/region
 static void fb_fill_rounded_rect(int x1, int y1, int width, int height, int radius, uint16_t color) {
     if (!ensure_frame_buffer()) return;
     int x2 = x1 + width - 1;
@@ -143,21 +169,189 @@ static void fb_fill_rounded_rect(int x1, int y1, int width, int height, int radi
                 if (dx * dx + dy * dy > radius * radius) draw = false;
             }
 
-            if (draw && x >= 0 && x < LCD_H_RES && y >= 0 && y < LCD_V_RES) {
+            if (draw && x >= 0 && x < LCD_H_RES && y >= 0 && y < TILE_HEIGHT) {
                 frame_buffer[y * LCD_H_RES + x] = color;
             }
         }
     }
 }
 
-// Draw official default VNPT background image to LCD
+// Draw official default VNPT background image to LCD (Tile-by-Tile 15.3KB Synchronous DMA rendering)
 static void draw_vnpt_background(void) {
     if (!ensure_frame_buffer()) return;
-    memcpy(frame_buffer, vnpt_bg_pixels, FRAME_BUF_SIZE);
-    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
+
+    for (int y = 0; y < LCD_V_RES; y += TILE_HEIGHT) {
+        int tile_h = TILE_HEIGHT;
+        if (y + tile_h > LCD_V_RES) tile_h = LCD_V_RES - y;
+
+        int offset_pixels = y * LCD_H_RES;
+        size_t bytes_to_copy = LCD_H_RES * tile_h * sizeof(uint16_t);
+        memcpy(frame_buffer, vnpt_bg_pixels + offset_pixels, bytes_to_copy);
+
+        draw_bitmap_sync(0, y, LCD_H_RES, y + tile_h, frame_buffer);
+    }
+
     current_state = STATE_IDLE_BG;
     has_custom_bg = false;
-    ESP_LOGI(TAG, "Displaying Official Pure White VNPT Standby Background Image...");
+    ESP_LOGI(TAG, "Displaying Official Pure White VNPT Standby Background Image (Tile-Rendered)...");
+}
+
+// Compact 5x8 font for ASCII 32 (' ') to 90 ('Z')
+static const uint8_t font_5x8[59][5] = {
+    {0x00, 0x00, 0x00, 0x00, 0x00}, // 32 ' '
+    {0x00, 0x00, 0x5F, 0x00, 0x00}, // 33 '!'
+    {0x00, 0x07, 0x00, 0x07, 0x00}, // 34 '"'
+    {0x14, 0x7F, 0x14, 0x7F, 0x14}, // 35 '#'
+    {0x24, 0x2A, 0x7F, 0x2A, 0x12}, // 36 '$'
+    {0x23, 0x13, 0x08, 0x64, 0x62}, // 37 '%'
+    {0x36, 0x49, 0x55, 0x22, 0x50}, // 38 '&'
+    {0x00, 0x05, 0x03, 0x00, 0x00}, // 39 '\''
+    {0x00, 0x1C, 0x22, 0x41, 0x00}, // 40 '('
+    {0x00, 0x41, 0x22, 0x1C, 0x00}, // 41 ')'
+    {0x14, 0x08, 0x3E, 0x08, 0x14}, // 42 '*'
+    {0x08, 0x08, 0x3E, 0x08, 0x08}, // 43 '+'
+    {0x00, 0x50, 0x30, 0x00, 0x00}, // 44 ','
+    {0x08, 0x08, 0x08, 0x08, 0x08}, // 45 '-'
+    {0x00, 0x60, 0x60, 0x00, 0x00}, // 46 '.'
+    {0x20, 0x10, 0x08, 0x04, 0x02}, // 47 '/'
+    {0x3E, 0x51, 0x49, 0x45, 0x3E}, // 48 '0'
+    {0x00, 0x42, 0x7F, 0x40, 0x00}, // 49 '1'
+    {0x42, 0x61, 0x51, 0x49, 0x46}, // 50 '2'
+    {0x21, 0x41, 0x45, 0x4B, 0x31}, // 51 '3'
+    {0x18, 0x14, 0x12, 0x7F, 0x10}, // 52 '4'
+    {0x27, 0x45, 0x45, 0x45, 0x39}, // 53 '5'
+    {0x3C, 0x4A, 0x49, 0x49, 0x30}, // 54 '6'
+    {0x01, 0x71, 0x09, 0x05, 0x03}, // 55 '7'
+    {0x36, 0x49, 0x49, 0x49, 0x36}, // 56 '8'
+    {0x06, 0x49, 0x49, 0x29, 0x1E}, // 57 '9'
+    {0x00, 0x36, 0x36, 0x00, 0x00}, // 58 ':'
+    {0x00, 0x56, 0x36, 0x00, 0x00}, // 59 ';'
+    {0x08, 0x14, 0x22, 0x41, 0x00}, // 60 '<'
+    {0x14, 0x14, 0x14, 0x14, 0x14}, // 61 '='
+    {0x00, 0x41, 0x22, 0x14, 0x08}, // 62 '>'
+    {0x02, 0x01, 0x51, 0x09, 0x06}, // 63 '?'
+    {0x32, 0x49, 0x79, 0x41, 0x3E}, // 64 '@'
+    {0x7E, 0x11, 0x11, 0x11, 0x7E}, // 65 'A'
+    {0x7F, 0x49, 0x49, 0x49, 0x36}, // 66 'B'
+    {0x3E, 0x41, 0x41, 0x41, 0x22}, // 67 'C'
+    {0x7F, 0x41, 0x41, 0x22, 0x1C}, // 68 'D'
+    {0x7F, 0x49, 0x49, 0x49, 0x41}, // 69 'E'
+    {0x7F, 0x09, 0x09, 0x09, 0x01}, // 70 'F'
+    {0x3E, 0x41, 0x49, 0x49, 0x7A}, // 71 'G'
+    {0x7F, 0x08, 0x08, 0x08, 0x7F}, // 72 'H'
+    {0x00, 0x41, 0x7F, 0x41, 0x00}, // 73 'I'
+    {0x20, 0x40, 0x41, 0x3F, 0x01}, // 74 'J'
+    {0x7F, 0x08, 0x14, 0x22, 0x41}, // 75 'K'
+    {0x7F, 0x40, 0x40, 0x40, 0x40}, // 76 'L'
+    {0x7F, 0x02, 0x0C, 0x02, 0x7F}, // 77 'M'
+    {0x7F, 0x04, 0x08, 0x10, 0x7F}, // 78 'N'
+    {0x3E, 0x41, 0x41, 0x41, 0x3E}, // 79 'O'
+    {0x7F, 0x09, 0x09, 0x09, 0x06}, // 80 'P'
+    {0x3E, 0x41, 0x51, 0x21, 0x5E}, // 81 'Q'
+    {0x7F, 0x09, 0x19, 0x29, 0x46}, // 82 'R'
+    {0x46, 0x49, 0x49, 0x49, 0x31}, // 83 'S'
+    {0x01, 0x01, 0x7F, 0x01, 0x01}, // 84 'T'
+    {0x3F, 0x40, 0x40, 0x40, 0x3F}, // 85 'U'
+    {0x1F, 0x20, 0x40, 0x20, 0x1F}, // 86 'V'
+    {0x3F, 0x40, 0x38, 0x40, 0x3F}, // 87 'W'
+    {0x63, 0x14, 0x08, 0x14, 0x63}, // 88 'X'
+    {0x07, 0x08, 0x70, 0x08, 0x07}, // 89 'Y'
+    {0x61, 0x51, 0x49, 0x45, 0x43}  // 90 'Z'
+};
+
+static void draw_string_5x8_tile(int start_x, int start_y, const char *str, uint16_t color, int tile_y_start, int tile_h) {
+    if (!str) return;
+    int cur_x = start_x;
+    while (*str) {
+        char c = *str++;
+        if (c >= 'a' && c <= 'z') c -= 32;
+        if (c >= 32 && c <= 90) {
+            const uint8_t *glyph = font_5x8[c - 32];
+            for (int col = 0; col < 5; col++) {
+                uint8_t line = glyph[col];
+                int px = cur_x + col;
+                if (px >= 0 && px < LCD_H_RES) {
+                    for (int row = 0; row < 8; row++) {
+                        if (line & (1 << row)) {
+                            int py = start_y + row;
+                            if (py >= tile_y_start && py < tile_y_start + tile_h) {
+                                int local_y = py - tile_y_start;
+                                frame_buffer[local_y * LCD_H_RES + px] = color;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cur_x += 6;
+    }
+}
+
+static void draw_string_5x8(int start_x, int start_y, const char *str, uint16_t color) {
+    draw_string_5x8_tile(start_x, start_y, str, color, 0, TILE_HEIGHT);
+}
+
+// Draw a status bar overlay on LCD to indicate WiFi / Connecting Status with English White Text
+void draw_wifi_status_overlay(const char *text, uint16_t bg_color, uint16_t text_color) {
+    if (!ensure_frame_buffer()) return;
+
+    int bar_h = 24;
+    int bar_y = LCD_V_RES - bar_h;
+
+    // Draw background bar into Tile Buffer
+    fb_fill_rect(0, 0, LCD_H_RES, bar_h, bg_color);
+
+    // Draw a small status indicator dot
+    int dot_x = 12;
+    int dot_y = 12;
+    for (int dy = -4; dy <= 4; dy++) {
+        for (int dx = -4; dx <= 4; dx++) {
+            if (dx*dx + dy*dy <= 16) {
+                int px = dot_x + dx;
+                int py = dot_y + dy;
+                if (px >= 0 && px < LCD_H_RES && py >= 0 && py < bar_h) {
+                    frame_buffer[py * LCD_H_RES + px] = COLOR_WHITE;
+                }
+            }
+        }
+    }
+
+    // Draw English status text in WHITE color
+    if (text && strlen(text) > 0) {
+        int text_len = strlen(text);
+        int text_w = text_len * 6 - 1;
+        int text_x = 24 + (LCD_H_RES - 24 - text_w) / 2;
+        if (text_x < 24) text_x = 24;
+        int text_y = (bar_h - 8) / 2;
+
+        draw_string_5x8(text_x, text_y, text, COLOR_WHITE);
+    }
+
+    // Flush only the bottom status bar region using 15.3KB Tile Buffer synchronously!
+    draw_bitmap_sync(0, bar_y, LCD_H_RES, LCD_V_RES, frame_buffer);
+}
+
+// Hide / Erase status bar overlay on LCD and restore original screen content underneath
+void hide_wifi_status_overlay(void) {
+    if (!ensure_frame_buffer()) return;
+
+    int bar_h = 24;
+    int bar_y = LCD_V_RES - bar_h;
+
+    if (current_state == STATE_IDLE_BG) {
+        int offset_pixels = bar_y * LCD_H_RES;
+        size_t bytes_to_copy = LCD_H_RES * bar_h * sizeof(uint16_t);
+        memcpy(frame_buffer, vnpt_bg_pixels + offset_pixels, bytes_to_copy);
+        draw_bitmap_sync(0, bar_y, LCD_H_RES, LCD_V_RES, frame_buffer);
+    } else if (current_state == STATE_QR_DISPLAY) {
+        render_qr_payment_screen(current_qr_payload, current_countdown);
+    } else if (current_state == STATE_IDLE_CUSTOM_BG || current_state == STATE_CUSTOM_BG_COUNTDOWN) {
+        uint32_t flash_addr = FLASH_CUSTOM_BG_OFFSET + bar_y * LCD_H_RES * sizeof(uint16_t);
+        size_t bytes = LCD_H_RES * bar_h * sizeof(uint16_t);
+        if (esp_flash_read(NULL, frame_buffer, flash_addr, bytes) == ESP_OK) {
+            draw_bitmap_sync(0, bar_y, LCD_H_RES, LCD_V_RES, frame_buffer);
+        }
+    }
 }
 
 // 8x12 Font Digits Bitmap ('0'-'9')
@@ -174,41 +368,59 @@ static const uint8_t font_8x12_digits[10][12] = {
     {0x3C,0x66,0x66,0x66,0x3E,0x06,0x06,0x06,0x06,0x66,0x3C,0x00}  // 9
 };
 
-// Draw countdown badge overlay onto frame_buffer
-static void fb_draw_countdown_badge(int seconds) {
-    if (!ensure_frame_buffer()) return;
+// Draw countdown badge using dedicated 68x24 buffer (stride 68) to prevent row-stride mismatch
+static void draw_countdown_badge(int seconds) {
     int badge_w = 68;
     int badge_h = 24;
     int badge_x = (LCD_H_RES - badge_w) / 2;
     int badge_y = 282;
 
-    fb_fill_rounded_rect(badge_x, badge_y, badge_w, badge_h, 6, COLOR_RED);
+    // Fill badge_buffer with rounded rectangle (RED)
+    for (int y = 0; y < badge_h; y++) {
+        for (int x = 0; x < badge_w; x++) {
+            bool draw = true;
+            int r = 6;
+            if (x < r && y < r) {
+                int dx = x - r; int dy = y - r;
+                if (dx*dx + dy*dy > r*r) draw = false;
+            } else if (x >= badge_w - r && y < r) {
+                int dx = x - (badge_w - 1 - r); int dy = y - r;
+                if (dx*dx + dy*dy > r*r) draw = false;
+            } else if (x < r && y >= badge_h - r) {
+                int dx = x - r; int dy = y - (badge_h - 1 - r);
+                if (dx*dx + dy*dy > r*r) draw = false;
+            } else if (x >= badge_w - r && y >= badge_h - r) {
+                int dx = x - (badge_w - 1 - r); int dy = y - (badge_h - 1 - r);
+                if (dx*dx + dy*dy > r*r) draw = false;
+            }
+            badge_buffer[y * badge_w + x] = draw ? COLOR_RED : COLOR_LIGHT_BG;
+        }
+    }
 
     int tens = (seconds / 10) % 10;
     int ones = seconds % 10;
 
     for (int d = 0; d < 2; d++) {
         int digit = (d == 0) ? tens : ones;
-        int start_x = badge_x + ((d == 0) ? 18 : 36);
-        int start_y = badge_y + 6;
+        int start_x = (d == 0) ? 18 : 36;
+        int start_y = 6;
         const uint8_t *glyph = font_8x12_digits[digit];
         for (int row = 0; row < 12; row++) {
             uint8_t line = glyph[row];
             int py = start_y + row;
             for (int col = 0; col < 8; col++) {
                 int px = start_x + col;
-                if (px < LCD_H_RES && py < LCD_V_RES) {
+                if (px < badge_w && py < badge_h) {
                     if (line & (0x80 >> col)) {
-                        frame_buffer[py * LCD_H_RES + px] = COLOR_WHITE;
+                        badge_buffer[py * badge_w + px] = COLOR_WHITE;
                     }
                 }
             }
         }
     }
-}
-static void draw_countdown_badge(int seconds) {
-    fb_draw_countdown_badge(seconds);
-    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
+
+    // Flush only the badge region (68x24) synchronously over DMA!
+    draw_bitmap_sync(badge_x, badge_y, badge_x + badge_w, badge_y + badge_h, badge_buffer);
 }
 
 static uint8_t *qr_code_buf = NULL;
@@ -224,19 +436,13 @@ static bool ensure_qr_buffers(void) {
     return (qr_code_buf != NULL && qr_temp_buf != NULL);
 }
 
-// Generate & Render QR Code screen into frame_buffer and flush to LCD using Nayuki QR Engine
+// Generate & Render QR Code screen tile-by-tile to LCD using 15.3KB Tile Buffer
 static void render_qr_payment_screen(const char *qr_data, int timeout_sec) {
     ESP_LOGI(TAG, "Rendering Payment QR Screen. Payload: %s, Timeout: %ds", qr_data, timeout_sec);
 
     if (!ensure_frame_buffer() || !ensure_qr_buffers()) return;
 
-    // 1. Fill Background with bright light gray
-    fb_fill_rect(0, 0, LCD_H_RES, LCD_V_RES, COLOR_LIGHT_BG);
-
-    // 2. Draw Top Banner (VNPT Blue)
-    fb_fill_rect(0, 0, LCD_H_RES, 45, COLOR_VNPT_BLUE);
-
-    // 3. Generate QR Code Matrix using Nayuki's ISO/IEC 18004 standard qrcodegen library
+    // 1. Generate QR Code Matrix using Nayuki's ISO/IEC 18004 standard qrcodegen library
     uint8_t *qrcode = qr_code_buf;
     uint8_t *tempBuffer = qr_temp_buf;
 
@@ -262,14 +468,10 @@ static void render_qr_payment_screen(const char *qr_data, int timeout_sec) {
     int size = qrcodegen_getSize(qrcode);
     ESP_LOGI(TAG, "QR generated successfully! Size: %dx%d", size, size);
 
-    // 4. Calculate QR display bounds (MAXIMIZED 216x216 pixels)
+    // QR & Logo geometry
     int qr_box_size = 216;
     int qr_box_x = (LCD_H_RES - qr_box_size) / 2; // 12px margins
     int qr_box_y = 54;
-
-    // Pure white rounded card background for QR with 12px radius
-    fb_fill_rounded_rect(qr_box_x, qr_box_y, qr_box_size, qr_box_size, 12, COLOR_WHITE);
-
     int quiet_zone = 1;
     int total_modules = size + quiet_zone * 2;
     int scale = qr_box_size / total_modules;
@@ -279,44 +481,176 @@ static void render_qr_payment_screen(const char *qr_data, int timeout_sec) {
     int start_offset_x = qr_box_x + (qr_box_size - actual_qr_width) / 2 + quiet_zone * scale;
     int start_offset_y = qr_box_y + (qr_box_size - actual_qr_width) / 2 + quiet_zone * scale;
 
-    for (int y = 0; y < size; y++) {
-        for (int x = 0; x < size; x++) {
-            bool is_black = qrcodegen_getModule(qrcode, x, y);
-            uint16_t color = is_black ? COLOR_BLACK : COLOR_WHITE;
-            int px = start_offset_x + x * scale;
-            int py = start_offset_y + y * scale;
-            fb_fill_rect(px, py, scale, scale, color);
-        }
-    }
-
-    // 5. Overlay Official Center Logo (36x36 with 8px rounded white card)
     int logo_x = (LCD_H_RES - VNPT_LOGO_WIDTH) / 2;
     int logo_y = qr_box_y + (qr_box_size - VNPT_LOGO_HEIGHT) / 2;
-
-    int logo_bg_w = VNPT_LOGO_WIDTH + 8; // 44px
-    int logo_bg_h = VNPT_LOGO_HEIGHT + 8; // 44px
+    int logo_bg_w = VNPT_LOGO_WIDTH + 8;
+    int logo_bg_h = VNPT_LOGO_HEIGHT + 8;
     int logo_bg_x = logo_x - 4;
     int logo_bg_y = logo_y - 4;
 
-    // White rounded card background for center logo (8px radius)
-    fb_fill_rounded_rect(logo_bg_x, logo_bg_y, logo_bg_w, logo_bg_h, 8, COLOR_WHITE);
+    int badge_w = 68;
+    int badge_h = 24;
+    int badge_x = (LCD_H_RES - badge_w) / 2;
+    int badge_y = 282;
 
-    // Copy official logo pixels to frame_buffer
-    for (int ly = 0; ly < VNPT_LOGO_HEIGHT; ly++) {
-        for (int lx = 0; lx < VNPT_LOGO_WIDTH; lx++) {
-            uint16_t pixel = vnpt_logo_center_pixels[ly * VNPT_LOGO_WIDTH + lx];
-            if (pixel != COLOR_WHITE) {
-                frame_buffer[(logo_y + ly) * LCD_H_RES + (logo_x + lx)] = pixel;
+    current_countdown = timeout_sec;
+    int tens = (current_countdown / 10) % 10;
+    int ones = current_countdown % 10;
+
+    // Render Tile by Tile (10 tiles total for 320px height)
+    for (int tile_y_start = 0; tile_y_start < LCD_V_RES; tile_y_start += TILE_HEIGHT) {
+        int tile_h = TILE_HEIGHT;
+        if (tile_y_start + tile_h > LCD_V_RES) tile_h = LCD_V_RES - tile_y_start;
+
+        // 1. Fill tile background with COLOR_LIGHT_BG
+        for (int i = 0; i < LCD_H_RES * tile_h; i++) {
+            frame_buffer[i] = COLOR_LIGHT_BG;
+        }
+
+        // 2. Draw Top Banner if inside this tile
+        for (int py = tile_y_start; py < tile_y_start + tile_h; py++) {
+            if (py < 45) {
+                int local_y = py - tile_y_start;
+                for (int px = 0; px < LCD_H_RES; px++) {
+                    frame_buffer[local_y * LCD_H_RES + px] = COLOR_VNPT_BLUE;
+                }
             }
         }
+        const char *header_text = "QUET MA DE THANH TOAN";
+        int text_w = strlen(header_text) * 6 - 1;
+        int text_x = (LCD_H_RES - text_w) / 2;
+        int text_y = (45 - 8) / 2;
+        draw_string_5x8_tile(text_x, text_y, header_text, COLOR_WHITE, tile_y_start, tile_h);
+
+        // 3. Draw QR Card background (White rounded rect)
+        for (int py = tile_y_start; py < tile_y_start + tile_h; py++) {
+            if (py >= qr_box_y && py < qr_box_y + qr_box_size) {
+                int local_y = py - tile_y_start;
+                for (int px = qr_box_x; px < qr_box_x + qr_box_size; px++) {
+                    bool draw = true;
+                    int r = 12;
+                    int x1 = qr_box_x;
+                    int y1 = qr_box_y;
+                    int x2 = qr_box_x + qr_box_size - 1;
+                    int y2 = qr_box_y + qr_box_size - 1;
+                    if (px < x1 + r && py < y1 + r) {
+                        int dx = px - (x1 + r); int dy = py - (y1 + r);
+                        if (dx*dx + dy*dy > r*r) draw = false;
+                    } else if (px > x2 - r && py < y1 + r) {
+                        int dx = px - (x2 - r); int dy = py - (y1 + r);
+                        if (dx*dx + dy*dy > r*r) draw = false;
+                    } else if (px < x1 + r && py > y2 - r) {
+                        int dx = px - (x1 + r); int dy = py - (y2 - r);
+                        if (dx*dx + dy*dy > r*r) draw = false;
+                    } else if (px > x2 - r && py > y2 - r) {
+                        int dx = px - (x2 - r); int dy = py - (y2 - r);
+                        if (dx*dx + dy*dy > r*r) draw = false;
+                    }
+                    if (draw) {
+                        frame_buffer[local_y * LCD_H_RES + px] = COLOR_WHITE;
+                    }
+                }
+            }
+        }
+
+        // 4. Draw QR Modules inside this tile
+        for (int qy = 0; qy < size; qy++) {
+            int py = start_offset_y + qy * scale;
+            if (py + scale > tile_y_start && py < tile_y_start + tile_h) {
+                for (int qx = 0; qx < size; qx++) {
+                    bool is_black = qrcodegen_getModule(qrcode, qx, qy);
+                    uint16_t color = is_black ? COLOR_BLACK : COLOR_WHITE;
+                    int px = start_offset_x + qx * scale;
+
+                    for (int sub_y = py; sub_y < py + scale; sub_y++) {
+                        if (sub_y >= tile_y_start && sub_y < tile_y_start + tile_h) {
+                            int local_y = sub_y - tile_y_start;
+                            for (int sub_x = px; sub_x < px + scale; sub_x++) {
+                                if (sub_x >= 0 && sub_x < LCD_H_RES) {
+                                    frame_buffer[local_y * LCD_H_RES + sub_x] = color;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Draw Center Logo Card (White rounded rectangle with 6px corner radius) & Pixels
+        for (int py = tile_y_start; py < tile_y_start + tile_h; py++) {
+            if (py >= logo_bg_y && py < logo_bg_y + logo_bg_h) {
+                int local_y = py - tile_y_start;
+                for (int px = logo_bg_x; px < logo_bg_x + logo_bg_w; px++) {
+                    bool draw = true;
+                    int r = 6;
+                    int x1 = logo_bg_x;
+                    int y1 = logo_bg_y;
+                    int x2 = logo_bg_x + logo_bg_w - 1;
+                    int y2 = logo_bg_y + logo_bg_h - 1;
+                    if (px < x1 + r && py < y1 + r) {
+                        int dx = px - (x1 + r); int dy = py - (y1 + r);
+                        if (dx*dx + dy*dy > r*r) draw = false;
+                    } else if (px > x2 - r && py < y1 + r) {
+                        int dx = px - (x2 - r); int dy = py - (y1 + r);
+                        if (dx*dx + dy*dy > r*r) draw = false;
+                    } else if (px < x1 + r && py > y2 - r) {
+                        int dx = px - (x1 + r); int dy = py - (y2 - r);
+                        if (dx*dx + dy*dy > r*r) draw = false;
+                    } else if (px > x2 - r && py > y2 - r) {
+                        int dx = px - (x2 - r); int dy = py - (y2 - r);
+                        if (dx*dx + dy*dy > r*r) draw = false;
+                    }
+                    if (draw) {
+                        frame_buffer[local_y * LCD_H_RES + px] = COLOR_WHITE;
+                    }
+                }
+            }
+        }
+        for (int ly = 0; ly < VNPT_LOGO_HEIGHT; ly++) {
+            int py = logo_y + ly;
+            if (py >= tile_y_start && py < tile_y_start + tile_h) {
+                int local_y = py - tile_y_start;
+                for (int lx = 0; lx < VNPT_LOGO_WIDTH; lx++) {
+                    uint16_t pixel = vnpt_logo_center_pixels[ly * VNPT_LOGO_WIDTH + lx];
+                    if (pixel != COLOR_WHITE) {
+                        frame_buffer[local_y * LCD_H_RES + (logo_x + lx)] = pixel;
+                    }
+                }
+            }
+        }
+
+        // 6. Draw Countdown Badge in bottom tile
+        for (int py = tile_y_start; py < tile_y_start + tile_h; py++) {
+            if (py >= badge_y && py < badge_y + badge_h) {
+                int local_y = py - tile_y_start;
+                for (int px = badge_x; px < badge_x + badge_w; px++) {
+                    frame_buffer[local_y * LCD_H_RES + px] = COLOR_RED;
+                }
+            }
+        }
+        for (int d = 0; d < 2; d++) {
+            int digit = (d == 0) ? tens : ones;
+            int start_x = badge_x + ((d == 0) ? 18 : 36);
+            int start_y = badge_y + 6;
+            const uint8_t *glyph = font_8x12_digits[digit];
+            for (int row = 0; row < 12; row++) {
+                int py = start_y + row;
+                if (py >= tile_y_start && py < tile_y_start + tile_h) {
+                    int local_y = py - tile_y_start;
+                    uint8_t line = glyph[row];
+                    for (int col = 0; col < 8; col++) {
+                        int px = start_x + col;
+                        if (px < LCD_H_RES && (line & (0x80 >> col))) {
+                            frame_buffer[local_y * LCD_H_RES + px] = COLOR_WHITE;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Flush Tile to LCD synchronously
+        draw_bitmap_sync(0, tile_y_start, LCD_H_RES, tile_y_start + tile_h, frame_buffer);
     }
-
-    // 6. Draw initial countdown badge directly inside frame_buffer
-    current_countdown = timeout_sec;
-    fb_draw_countdown_badge(current_countdown);
-
-    // 7. Flush entire frame_buffer to LCD in ONE single DMA transaction!
-    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
 
     current_state = STATE_QR_DISPLAY;
 }
@@ -334,14 +668,17 @@ static void timer_task(void *pvParameters) {
                 } else {
                     if (has_custom_bg) {
                         ESP_LOGI(TAG, "QR Timeout reached (0s). Restoring Custom Raw Background from Flash...");
-                        esp_err_t rerr = esp_flash_read(NULL, frame_buffer, FLASH_CUSTOM_BG_OFFSET, FRAME_BUF_SIZE);
-                        if (rerr == ESP_OK) {
-                            esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
-                            current_state = STATE_IDLE_CUSTOM_BG;
-                        } else {
-                            ESP_LOGE(TAG, "Failed to read custom background from Flash! Returning to VNPT BG.");
-                            draw_vnpt_background();
+                        for (int y = 0; y < LCD_V_RES; y += TILE_HEIGHT) {
+                            int tile_h = TILE_HEIGHT;
+                            if (y + tile_h > LCD_V_RES) tile_h = LCD_V_RES - y;
+                            uint32_t flash_addr = FLASH_CUSTOM_BG_OFFSET + y * LCD_H_RES * sizeof(uint16_t);
+                            size_t bytes = LCD_H_RES * tile_h * sizeof(uint16_t);
+                            esp_err_t rerr = esp_flash_read(NULL, frame_buffer, flash_addr, bytes);
+                            if (rerr == ESP_OK) {
+                                draw_bitmap_sync(0, y, LCD_H_RES, y + tile_h, frame_buffer);
+                            }
                         }
+                        current_state = STATE_IDLE_CUSTOM_BG;
                     } else {
                         ESP_LOGI(TAG, "QR Timeout reached. Returning to Official VNPT Standby Background...");
                         draw_vnpt_background();
@@ -378,13 +715,15 @@ static void process_at_command(const char *cmd) {
     const char *bg_ptr = strstr(upper_cmd, "AT+BG");
     const char *clear_ptr = strstr(upper_cmd, "AT+CLEAR");
     const char *ver_ptr = strstr(upper_cmd, "AT+VER");
+    const char *wifi_ptr = strstr(upper_cmd, "AT+WIFI=");
+    const char *wifistatus_ptr = strstr(upper_cmd, "AT+WIFISTATUS");
+    const char *ping_ptr = strstr(upper_cmd, "AT+PING");
 
     if (qr_ptr) {
         const char *orig_param = cmd + ((qr_ptr - upper_cmd) + 6);
         char raw[512] = {0};
         strncpy(raw, orig_param, sizeof(raw) - 1);
 
-        // Strip trailing \r, \n, spaces, tabs from raw string
         size_t rlen = strlen(raw);
         while (rlen > 0 && (raw[rlen - 1] == '\r' || raw[rlen - 1] == '\n' || raw[rlen - 1] == ' ' || raw[rlen - 1] == '\t')) {
             raw[--rlen] = '\0';
@@ -397,8 +736,7 @@ static void process_at_command(const char *cmd) {
         int timeout = default_timeout_sec;
 
         if (*p == '"') {
-            // Quoted payload: AT+QR="payload",timeout  OR  AT+QR="payload"
-            p++; // Skip opening quote
+            p++;
             char *close_quote = strrchr(p, '"');
             if (close_quote) {
                 size_t plen = close_quote - p;
@@ -406,17 +744,14 @@ static void process_at_command(const char *cmd) {
                 strncpy(payload, p, plen);
                 payload[plen] = '\0';
 
-                // Look for comma after closing quote
                 char *comma = strchr(close_quote + 1, ',');
                 if (comma) {
                     timeout = atoi(comma + 1);
                 }
             } else {
-                // Missing closing quote, treat entire string as payload
                 strncpy(payload, p, sizeof(payload) - 1);
             }
         } else {
-            // Unquoted payload: AT+QR=payload,timeout  OR  AT+QR=payload
             char *comma = strrchr(p, ',');
             if (comma && comma > p && (comma[1] >= '0' && comma[1] <= '9')) {
                 size_t plen = comma - p;
@@ -446,8 +781,9 @@ static void process_at_command(const char *cmd) {
         raw_stream_display_timeout = t;
         current_state = STATE_RAW_STREAM;
         stream_buf_offset = 0;
-        stream_skip_whitespace = true; // Bo qua \n thua co the den sau \r
-        ESP_LOGI(TAG, "RAW_STREAM: san sang nhan %d bytes (Display timeout: %ds)...", FRAME_BUF_SIZE, raw_stream_display_timeout);
+        stream_tile_index = 0;
+        stream_skip_whitespace = true;
+        ESP_LOGI(TAG, "RAW_STREAM: san sang nhan 153600 bytes (Display timeout: %ds)...", raw_stream_display_timeout);
         printf("OK\r\n");
         fflush(stdout);
     }
@@ -459,6 +795,104 @@ static void process_at_command(const char *cmd) {
     else if (ver_ptr) {
         printf("+VER: F91_VNPT_STANDEE_V1.0\r\nOK\r\n");
         fflush(stdout);
+    }
+    else if (wifi_ptr) {
+        const char *param = cmd + ((wifi_ptr - upper_cmd) + 8);
+        char ssid[32] = {0};
+        char pass[64] = {0};
+
+        if (sscanf(param, "\"%31[^\"]\",\"%63[^\"]\"", ssid, pass) == 2 ||
+            sscanf(param, "%31[^,],%63s", ssid, pass) == 2) {
+            printf("+WIFI: CONNECTING...\r\n");
+            fflush(stdout);
+            if (wifi_manager_connect(ssid, pass)) {
+                char ip_str[16] = {0};
+                wifi_manager_get_ip_str(ip_str, sizeof(ip_str));
+                wifi_mgr_state_t st = wifi_manager_get_state();
+                if (st == WIFI_MGR_CONNECTED_GOT_INTERNET) {
+                    printf("+WIFI: CONNECTED, IP=%s, INTERNET=OK\r\nOK\r\n", ip_str);
+                } else {
+                    printf("+WIFI: CONNECTED, IP=%s, INTERNET=FAIL\r\nOK\r\n", ip_str);
+                }
+            } else {
+                printf("+WIFI: ERROR (CONNECT_FAILED)\r\n");
+            }
+        } else if (sscanf(param, "\"%31[^\"]\"", ssid) == 1 || sscanf(param, "%31s", ssid) == 1) {
+            printf("+WIFI: CONNECTING...\r\n");
+            fflush(stdout);
+            if (wifi_manager_connect(ssid, "")) {
+                char ip_str[16] = {0};
+                wifi_manager_get_ip_str(ip_str, sizeof(ip_str));
+                printf("+WIFI: CONNECTED, IP=%s\r\nOK\r\n", ip_str);
+            } else {
+                printf("+WIFI: ERROR (CONNECT_FAILED)\r\n");
+            }
+        } else {
+            printf("+WIFI: ERROR (INVALID_PARAMS)\r\n");
+        }
+        fflush(stdout);
+    }
+    else if (wifistatus_ptr) {
+        wifi_mgr_state_t st = wifi_manager_get_state();
+        char ip_str[16] = "0.0.0.0";
+        wifi_manager_get_ip_str(ip_str, sizeof(ip_str));
+        const char *st_str = "DISCONNECTED";
+        if (st == WIFI_MGR_CONNECTING) st_str = "CONNECTING";
+        else if (st == WIFI_MGR_CONNECTED_NO_INTERNET) st_str = "CONNECTED_NO_INTERNET";
+        else if (st == WIFI_MGR_CONNECTED_GOT_INTERNET) st_str = "CONNECTED_GOT_INTERNET";
+        else if (st == WIFI_MGR_SOFTAP_MODE) st_str = "SOFTAP_MODE";
+
+        printf("+WIFISTATUS: %s, IP=%s\r\nOK\r\n", st_str, ip_str);
+        fflush(stdout);
+    }
+    else if (ping_ptr) {
+        printf("+PING: CHECKING INTERNET...\r\n");
+        fflush(stdout);
+        if (internet_check_perform()) {
+            printf("+PING: INTERNET OK (Google/Cloudflare reached)\r\nOK\r\n");
+        } else {
+            printf("+PING: INTERNET FAIL\r\nERROR\r\n");
+        }
+        fflush(stdout);
+    }
+    else if (strstr(upper_cmd, "AT+STATICIP=")) {
+        const char *param = cmd + 12;
+        char ip[16] = {0}, netmask[16] = {0}, gw[16] = {0}, dns[16] = {0};
+        if (sscanf(param, "1,\"%15[^\"]\",\"%15[^\"]\",\"%15[^\"]\",\"%15[^\"]\"", ip, netmask, gw, dns) == 4 ||
+            sscanf(param, "1,%15[^,],%15[^,],%15[^,],%15s", ip, netmask, gw, dns) == 4) {
+            wifi_static_ip_config_t cfg = { .use_static_ip = true };
+            strncpy(cfg.ip, ip, sizeof(cfg.ip) - 1);
+            strncpy(cfg.netmask, netmask, sizeof(cfg.netmask) - 1);
+            strncpy(cfg.gateway, gw, sizeof(cfg.gateway) - 1);
+            strncpy(cfg.dns, dns, sizeof(cfg.dns) - 1);
+            wifi_manager_set_static_ip_config(&cfg);
+            printf("+STATICIP: ENABLED, IP=%s, GW=%s, DNS=%s\r\nOK\r\n", ip, gw, dns);
+        } else {
+            wifi_static_ip_config_t cfg = { .use_static_ip = false };
+            wifi_manager_set_static_ip_config(&cfg);
+            printf("+STATICIP: DISABLED (DHCP ENABLED)\r\nOK\r\n");
+        }
+        fflush(stdout);
+    }
+    else if (strstr(upper_cmd, "AT+WIFIRESTART") || strstr(upper_cmd, "AT+WIFIRST")) {
+        printf("+WIFIRESTART: RESTARTING...\r\n");
+        fflush(stdout);
+        wifi_manager_restart();
+        printf("OK\r\n");
+        fflush(stdout);
+    }
+    else if (strstr(upper_cmd, "AT+WIFIRESET") || strstr(upper_cmd, "AT+APMODE")) {
+        printf("+WIFIRESET: ERASING NVS & OPENING SOFTAP \"ESP32_WiFi_Setup\"...\r\n");
+        fflush(stdout);
+        wifi_manager_reset_to_ap_mode();
+        printf("OK\r\n");
+        fflush(stdout);
+    }
+    else if (strstr(upper_cmd, "AT+RST") || strstr(upper_cmd, "AT+RESTART")) {
+        printf("+RST: REBOOTING HARDWARE...\r\nOK\r\n");
+        fflush(stdout);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
     }
 }
 
@@ -501,52 +935,55 @@ static void usb_cdc_task(void *pvParameters) {
                         }
                         stream_buf_offset++;
                     }
-                }
 
-                if (stream_buf_offset >= FRAME_BUF_SIZE) {
-                    ESP_LOGI(TAG, "Nhan du %d bytes. Dang render toan bo frame...", FRAME_BUF_SIZE);
-                    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
-                    stream_buf_offset = 0;
-                    has_custom_bg = true;
+                    if (stream_buf_offset >= FRAME_BUF_SIZE) {
+                        // Received 1 tile (15360 bytes / 32 lines)
+                        int y_start = stream_tile_index * TILE_HEIGHT;
+                        int y_end = y_start + TILE_HEIGHT;
+                        if (y_end > LCD_V_RES) y_end = LCD_V_RES;
 
-                    // Erase & Save custom background to Flash offset 0x1DA000 (38 sectors = 0x26000)
-                    ESP_LOGI(TAG, "Saving custom background to Flash offset 0x%X (erase size: 0x%X)...", FLASH_CUSTOM_BG_OFFSET, FLASH_CUSTOM_BG_ERASE_SIZE);
-                    esp_err_t err1 = esp_flash_erase_region(NULL, FLASH_CUSTOM_BG_OFFSET, FLASH_CUSTOM_BG_ERASE_SIZE);
-                    esp_err_t err2 = esp_flash_write(NULL, frame_buffer, FLASH_CUSTOM_BG_OFFSET, FRAME_BUF_SIZE);
-                    if (err1 == ESP_OK && err2 == ESP_OK) {
-                        ESP_LOGI(TAG, "Custom background saved to Flash successfully!");
-                    } else {
-                        ESP_LOGE(TAG, "Failed to save custom background to Flash (erase: 0x%x, write: 0x%x)", err1, err2);
+                        draw_bitmap_sync(0, y_start, LCD_H_RES, y_end, frame_buffer);
+
+                        // Save tile to Flash at FLASH_CUSTOM_BG_OFFSET + tile_offset
+                        uint32_t flash_addr = FLASH_CUSTOM_BG_OFFSET + (stream_tile_index * FRAME_BUF_SIZE);
+                        if (stream_tile_index == 0) {
+                            esp_flash_erase_region(NULL, FLASH_CUSTOM_BG_OFFSET, FLASH_CUSTOM_BG_ERASE_SIZE);
+                        }
+                        esp_flash_write(NULL, frame_buffer, flash_addr, FRAME_BUF_SIZE);
+
+                        stream_tile_index++;
+                        stream_buf_offset = 0;
+
+                        if (stream_tile_index >= (LCD_V_RES / TILE_HEIGHT)) {
+                            ESP_LOGI(TAG, "Nhan du 153600 bytes! Render & Flash hoan tat.");
+                            has_custom_bg = true;
+
+                            if (raw_stream_display_timeout > 0) {
+                                custom_bg_countdown = raw_stream_display_timeout;
+                                current_state = STATE_CUSTOM_BG_COUNTDOWN;
+                            } else {
+                                current_state = STATE_IDLE_CUSTOM_BG;
+                            }
+                            printf("+DTIME: OK\r\n");
+                            fflush(stdout);
+                        }
                     }
-
-                    if (raw_stream_display_timeout > 0) {
-                        custom_bg_countdown = raw_stream_display_timeout;
-                        current_state = STATE_CUSTOM_BG_COUNTDOWN;
-                        ESP_LOGI(TAG, "Custom raw background rendered! Active for %ds before returning to VNPT BG.", custom_bg_countdown);
-                    } else {
-                        current_state = STATE_IDLE_CUSTOM_BG;
-                        ESP_LOGI(TAG, "Custom raw background set permanently (State -> IDLE_CUSTOM_BG).");
-                    }
-                    printf("+DTIME: OK\r\n");
-                    fflush(stdout);
                 }
             } else {
                 stream_idle_counter++;
-                // Allow up to 120s (12000 * 10ms) while user selects file in SSCOM (stream_buf_offset == 0)
-                // Allow 15s mid-stream pause if stream_buf_offset > 0
-                int max_idle = (stream_buf_offset == 0) ? 12000 : 1500;
+                int max_idle = (stream_buf_offset == 0 && stream_tile_index == 0) ? 12000 : 1500;
                 if (stream_idle_counter > max_idle) {
-                    if (stream_buf_offset >= (FRAME_BUF_SIZE - 16384)) {
-                        ESP_LOGI(TAG, "Nhan gan du %d/%d bytes. Dang render...", (int)stream_buf_offset, FRAME_BUF_SIZE);
-                        esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, frame_buffer);
+                    if (stream_tile_index > 0) {
+                        ESP_LOGI(TAG, "Stream partial completion (%d tiles).", stream_tile_index);
                         printf("+DTIME: OK (Partial)\r\n");
                         fflush(stdout);
                     } else if (stream_buf_offset > 0) {
-                        ESP_LOGW(TAG, "RAW_STREAM incomplete (%d/%d bytes). Timeout reset.", (int)stream_buf_offset, FRAME_BUF_SIZE);
-                        printf("+DTIME: ERROR (Timeout %d/153600)\r\n", (int)stream_buf_offset);
+                        ESP_LOGW(TAG, "RAW_STREAM incomplete. Timeout reset.");
+                        printf("+DTIME: ERROR (Timeout)\r\n");
                         fflush(stdout);
                     }
                     stream_buf_offset = 0;
+                    stream_tile_index = 0;
                     current_state = STATE_IDLE_BG;
                     stream_idle_counter = 0;
                 }
@@ -617,12 +1054,12 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(esp_lcd_new_i80_bus(&bus_config, &i80_bus));
 
-    // 3. Initialize Panel IO (CS=13, pclk=4MHz)
+    // 3. Initialize Panel IO (CS=13, pclk=4MHz) & Register DMA Done Callback
     esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_i80_config_t io_config = {
         .cs_gpio_num = PIN_LCD_CS,
         .pclk_hz = 4 * 1000 * 1000,
-        .trans_queue_depth = 10,
+        .trans_queue_depth = 2,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .dc_levels = {
@@ -633,6 +1070,12 @@ void app_main(void) {
         },
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_i80(i80_bus, &io_config, &io_handle));
+
+    lcd_trans_sem = xSemaphoreCreateBinary();
+    esp_lcd_panel_io_callbacks_t cbs = {
+        .on_color_trans_done = lcd_on_trans_done,
+    };
+    ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(io_handle, &cbs, NULL));
 
     // 4. Initialize ST7789 Panel
     esp_lcd_panel_dev_config_t panel_config = {
@@ -650,10 +1093,23 @@ void app_main(void) {
     // Turn backlight ON
     gpio_set_level(PIN_BK_LIGHT, 1);
 
+    // Allocate frame_buffer ONCE at boot time before WiFi/other allocations
+    if (!frame_buffer) {
+        frame_buffer = heap_caps_malloc(FRAME_BUF_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (frame_buffer) {
+            ESP_LOGI(TAG, "Successfully allocated DMA frame_buffer (%d bytes)", (int)FRAME_BUF_SIZE);
+        } else {
+            ESP_LOGE(TAG, "CRITICAL: Failed to allocate DMA frame_buffer!");
+        }
+    }
+
     // 5. Render default VNPT Standby Background Image
     draw_vnpt_background();
 
-    // 6. Create Tasks
+    // 6. Initialize WiFi Manager & NVS WiFi credentials
+    wifi_manager_init();
+
+    // 7. Create Tasks
     xTaskCreate(usb_cdc_task, "usb_cdc_task", 8192, NULL, 5, NULL);
     xTaskCreate(timer_task, "timer_task", 4096, NULL, 5, NULL);
     ESP_LOGI(TAG, "Free Heap: %u bytes, Min Free Heap: %u bytes", (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
