@@ -2,6 +2,7 @@
 #include "internet_check.h"
 #include "web_server.h"
 #include "dns_server.h"
+#include "mqtt_manager.h"
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -38,14 +39,27 @@ static wifi_static_ip_config_t s_static_ip_config = {
 extern void draw_wifi_status_overlay(const char *text, uint16_t bg_color, uint16_t text_color);
 extern void hide_wifi_status_overlay(void);
 
-static void auto_hide_overlay_task(void *pvParameters) {
-    vTaskDelay(pdMS_TO_TICKS(4000));
-    if (s_current_state == WIFI_MGR_CONNECTED_GOT_INTERNET) {
-        hide_wifi_status_overlay();
-        dns_server_stop();
-        web_server_stop();
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        ESP_LOGI(TAG, "Internet verified -> Stopped SoftAP ESP32_WiFi_Setup & switched to pure STA mode");
+static void wifi_ip_verify_task(void *pvParameters) {
+    draw_wifi_status_overlay("CHECKING INTERNET...", 0x07E0, 0xFFFF);
+
+    if (internet_check_perform()) {
+        s_current_state = WIFI_MGR_CONNECTED_GOT_INTERNET;
+        ESP_LOGI(TAG, ">>> WIFI & INTERNET FULLY CONNECTED & VERIFIED <<<");
+        draw_wifi_status_overlay("INTERNET OK", 0x07E0, 0xFFFF);
+        mqtt_manager_start();
+
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        if (s_current_state == WIFI_MGR_CONNECTED_GOT_INTERNET) {
+            wifi_manager_check_and_close_captive_portal();
+            if (wifi_manager_has_saved_credentials() && mqtt_manager_has_saved_config()) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                hide_wifi_status_overlay();
+            }
+        }
+    } else {
+        s_current_state = WIFI_MGR_CONNECTED_NO_INTERNET;
+        ESP_LOGW(TAG, ">>> LOCAL IP OK, BUT NO INTERNET ACCESS <<<");
+        draw_wifi_status_overlay("NO INTERNET", 0xF800, 0xFFFF);
     }
     vTaskDelete(NULL);
 }
@@ -85,6 +99,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Connecting to AP...");
         draw_wifi_status_overlay("CONNECTING...", 0x001F, 0xFFFF); // Xanh dương / Chữ trắng
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        mqtt_manager_stop();
         if (s_current_state == WIFI_MGR_SOFTAP_MODE) {
             ESP_LOGI(TAG, "In SoftAP mode, ignoring STA disconnect event.");
             return;
@@ -107,21 +122,10 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
 
-        draw_wifi_status_overlay("CHECKING INTERNET...", 0x07E0, 0xFFFF); // Xanh lá / Chữ trắng
-
-        // Đã có IP Local -> Tiến hành kiểm tra xem thực sự có INTERNET hay không (Ping Google/Cloudflare)
-        if (internet_check_perform()) {
-            s_current_state = WIFI_MGR_CONNECTED_GOT_INTERNET;
-            ESP_LOGI(TAG, ">>> WIFI & INTERNET FULLY CONNECTED & VERIFIED <<<");
-            draw_wifi_status_overlay("INTERNET OK", 0x07E0, 0xFFFF); // Xanh lá / Chữ trắng
-            xTaskCreate(auto_hide_overlay_task, "auto_hide_overlay", 2048, NULL, 5, NULL);
-        } else {
-            s_current_state = WIFI_MGR_CONNECTED_NO_INTERNET;
-            ESP_LOGW(TAG, ">>> LOCAL IP OK, BUT NO INTERNET ACCESS <<<");
-            draw_wifi_status_overlay("NO INTERNET", 0xF800, 0xFFFF); // Đỏ / Chữ trắng
-        }
+        xTaskCreate(wifi_ip_verify_task, "wifi_ip_verify", 4096, NULL, 5, NULL);
     }
 }
+
 
 void wifi_manager_init(void) {
     esp_err_t ret = nvs_flash_init();
@@ -331,5 +335,36 @@ void wifi_manager_set_static_ip_config(const wifi_static_ip_config_t *cfg) {
             nvs_commit(my_handle);
             nvs_close(my_handle);
         }
+    }
+}
+
+bool wifi_manager_has_saved_credentials(void) {
+    nvs_handle_t my_handle;
+    char saved_ssid[32] = {0};
+    size_t ssid_len = sizeof(saved_ssid);
+    if (nvs_open("wifi_store", NVS_READONLY, &my_handle) == ESP_OK) {
+        nvs_get_str(my_handle, "ssid", saved_ssid, &ssid_len);
+        nvs_close(my_handle);
+    }
+    return (strlen(saved_ssid) > 0);
+}
+
+void wifi_manager_check_and_close_captive_portal(void) {
+    bool wifi_saved = wifi_manager_has_saved_credentials();
+    bool mqtt_saved = mqtt_manager_has_saved_config();
+
+    ESP_LOGI(TAG, "Checking Captive Portal Status: WiFi Saved=%d, MQTT Saved=%d", wifi_saved, mqtt_saved);
+
+    if (wifi_saved && mqtt_saved) {
+        wifi_mode_t mode;
+        esp_wifi_get_mode(&mode);
+        if (mode == WIFI_MODE_APSTA || mode == WIFI_MODE_AP) {
+            dns_server_stop();
+            web_server_stop();
+            esp_wifi_set_mode(WIFI_MODE_STA);
+            ESP_LOGI(TAG, "Both WiFi & MQTT config saved in NVS -> Stopped SoftAP Captive Portal & switched to pure STA mode");
+        }
+    } else {
+        ESP_LOGI(TAG, "Captive Portal kept active because credentials pending (WiFi Saved=%d, MQTT Saved=%d)", wifi_saved, mqtt_saved);
     }
 }

@@ -62,4 +62,14 @@ void wifi_manager_get_ip_str(char *ip_buf, size_t buf_len);
 void wifi_manager_get_static_ip_config(wifi_static_ip_config_t *cfg);
 void wifi_manager_set_static_ip_config(const wifi_static_ip_config_t *cfg);
 
+/**
+ * @brief Kiểm tra xem thông tin WiFi đã được lưu vào NVS chưa
+ */
+bool wifi_manager_has_saved_credentials(void);
+
+/**
+ * @brief Kiểm tra nếu CẢ WiFi và MQTT đều đã lưu cấu hình thì mới đóng Captive Portal SoftAP
+ */
+void wifi_manager_check_and_close_captive_portal(void);
+
 #endif // WIFI_MANAGER_H

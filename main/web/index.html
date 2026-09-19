@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VNPT Standee F91 - Cấu Hình WiFi</title>
+    <title>VNPT Standee F91 - Cấu Hình Mạng & MQTT</title>
     <style>
         :root {
             --primary: #005aab;
@@ -24,6 +24,7 @@
         .header p { font-size: 13px; opacity: 0.9; }
         .content { padding: 20px; }
         .card { background: #fafafa; border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 20px; }
+        .card-title { font-size: 14px; font-weight: 700; color: var(--primary); margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
         .status-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 14px; }
         .status-row:last-child { margin-bottom: 0; }
         .badge { font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
@@ -32,7 +33,7 @@
         .badge-warning { background: #fef3c7; color: #92400e; }
         .form-group { margin-bottom: 16px; }
         label { display: block; font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
-        input[type="text"], input[type="password"] { width: 100%; padding: 12px 14px; border: 1.5px solid var(--border); border-radius: 8px; font-size: 14px; outline: none; transition: border-color 0.2s; }
+        input[type="text"], input[type="password"], input[type="number"] { width: 100%; padding: 12px 14px; border: 1.5px solid var(--border); border-radius: 8px; font-size: 14px; outline: none; transition: border-color 0.2s; }
         input:focus { border-color: var(--primary); }
         .checkbox-group { display: flex; align-items: center; margin-bottom: 16px; }
         .checkbox-group input { width: 18px; height: 18px; margin-right: 8px; cursor: pointer; }
@@ -56,10 +57,11 @@
     <div class="container">
         <div class="header">
             <h1>VNPT STANDEE F91</h1>
-            <p>Cấu Hình Mạng WiFi & Internet</p>
+            <p>Cấu Hình Mạng WiFi & HiveMQ Cloud</p>
         </div>
         <div class="content">
             <div class="card">
+                <div class="card-title">📡 TRẠNG THÁI THIẾT BỊ</div>
                 <div class="status-row">
                     <span>Trạng Thái Mạng:</span>
                     <span id="statusBadge" class="badge badge-warning">Đang kiểm tra...</span>
@@ -69,12 +71,13 @@
                     <strong id="ipAddress">0.0.0.0</strong>
                 </div>
                 <div class="status-row">
-                    <span>WiFi Đã Nối:</span>
-                    <strong id="connectedSSID">Chưa có</strong>
+                    <span>Trạng Thái MQTT:</span>
+                    <span id="mqttStatusBadge" class="badge badge-warning">Chưa nối</span>
                 </div>
             </div>
 
             <form id="wifiForm" onsubmit="saveConfig(event)">
+                <div class="card-title">📶 CẤU HÌNH WIFI</div>
                 <div class="form-group">
                     <label for="ssid">Tên WiFi (SSID)</label>
                     <input type="text" id="ssid" placeholder="Nhập hoặc chọn WiFi bên dưới" required>
@@ -113,6 +116,35 @@
 
             <button type="button" class="btn btn-secondary" onclick="scanWifi()">🔍 Quét Danh Sách WiFi</button>
             <div id="wifiList" class="wifi-list" style="display: none;"></div>
+
+            <form id="mqttForm" onsubmit="saveMqttConfig(event)" style="margin-top: 24px;">
+                <div class="card-title">☁️ CẤU HÌNH HIVEMQ CLOUD (MQTT)</div>
+                <div class="form-group">
+                    <label for="mqttHost">Broker Host (TLS URL)</label>
+                    <input type="text" id="mqttHost" placeholder="4a1375...s1.eu.hivemq.cloud">
+                </div>
+                <div class="form-group">
+                    <label for="mqttPort">Cổng (Port)</label>
+                    <input type="number" id="mqttPort" value="8883">
+                </div>
+                <div class="form-group">
+                    <label for="mqttUser">Username</label>
+                    <input type="text" id="mqttUser" placeholder="HiveMQ Username">
+                </div>
+                <div class="form-group">
+                    <label for="mqttPass">Password</label>
+                    <input type="password" id="mqttPass" placeholder="HiveMQ Password">
+                </div>
+                <div class="form-group">
+                    <label for="mqttSub">Topic Nhận Lệnh (Subscribe)</label>
+                    <input type="text" id="mqttSub" value="vnpt/f91/cmd">
+                </div>
+                <div class="form-group">
+                    <label for="mqttPub">Topic Báo Trạng Thái (Publish)</label>
+                    <input type="text" id="mqttPub" value="vnpt/f91/status">
+                </div>
+                <button type="submit" id="btnMqttSubmit" class="btn btn-primary" style="background:#10b981;">Lưu Cấu Hình MQTT</button>
+            </form>
         </div>
         <div class="footer">
             VNPT Standee Payment Firmware v1.0 © 2026
@@ -138,7 +170,6 @@
                         badge.innerText = 'CHƯA KẾT NỐI';
                     }
                     document.getElementById('ipAddress').innerText = data.ip || '0.0.0.0';
-                    document.getElementById('connectedSSID').innerText = data.ssid || 'Chưa nối';
                     if (data.static_cfg) {
                         document.getElementById('useStatic').checked = data.static_cfg.use_static;
                         document.getElementById('staticIp').value = data.static_cfg.ip || '';
@@ -147,6 +178,25 @@
                         document.getElementById('dns').value = data.static_cfg.dns || '8.8.8.8';
                         toggleStaticFields();
                     }
+                })
+                .catch(() => {});
+
+            fetch('/api/mqtt')
+                .then(r => r.json())
+                .then(data => {
+                    const mBadge = document.getElementById('mqttStatusBadge');
+                    if (data.connected) {
+                        mBadge.className = 'badge badge-success';
+                        mBadge.innerText = 'ĐÃ KẾT NỐI HIVEMQ';
+                    } else {
+                        mBadge.className = 'badge badge-warning';
+                        mBadge.innerText = 'CHƯA NỐI BROKER';
+                    }
+                    if (data.host) document.getElementById('mqttHost').value = data.host;
+                    if (data.port) document.getElementById('mqttPort').value = data.port;
+                    if (data.user) document.getElementById('mqttUser').value = data.user;
+                    if (data.sub_topic) document.getElementById('mqttSub').value = data.sub_topic;
+                    if (data.pub_topic) document.getElementById('mqttPub').value = data.pub_topic;
                 })
                 .catch(() => {});
         }
@@ -234,6 +284,40 @@
                 alert('Lỗi gửi cấu hình: ' + err);
                 btn.disabled = false;
                 btn.innerText = 'Lưu & Kết Nối WiFi';
+            });
+        }
+
+        function saveMqttConfig(e) {
+            e.preventDefault();
+            const btn = document.getElementById('btnMqttSubmit');
+            const host = document.getElementById('mqttHost').value.trim();
+            const port = parseInt(document.getElementById('mqttPort').value) || 8883;
+            const user = document.getElementById('mqttUser').value.trim();
+            const pass = document.getElementById('mqttPass').value;
+            const sub_topic = document.getElementById('mqttSub').value.trim();
+            const pub_topic = document.getElementById('mqttPub').value.trim();
+
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span> Đang lưu MQTT...';
+
+            fetch('/api/mqtt', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    host, port, user, pass, sub_topic, pub_topic, use_tls: (port === 8883 || port === 8884)
+                })
+            })
+            .then(r => r.json())
+            .then(data => {
+                alert('Đã lưu cấu hình MQTT HiveMQ!');
+                btn.disabled = false;
+                btn.innerText = 'Lưu Cấu Hình MQTT';
+                fetchStatus();
+            })
+            .catch(err => {
+                alert('Lỗi lưu MQTT: ' + err);
+                btn.disabled = false;
+                btn.innerText = 'Lưu Cấu Hình MQTT';
             });
         }
 

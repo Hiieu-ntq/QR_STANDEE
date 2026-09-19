@@ -1,5 +1,6 @@
 #include "web_server.h"
 #include "wifi_manager.h"
+#include "mqtt_manager.h"
 #include <string.h>
 #include <stdlib.h>
 #include "esp_http_server.h"
@@ -218,6 +219,78 @@ static esp_err_t http_404_redirect_handler(httpd_req_t *req, httpd_err_code_t er
     return ESP_OK;
 }
 
+static esp_err_t mqtt_get_handler(httpd_req_t *req) {
+    mqtt_config_t cfg;
+    mqtt_manager_get_config(&cfg);
+    bool conn = mqtt_manager_is_connected();
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "connected", conn);
+    cJSON_AddStringToObject(root, "host", cfg.broker_host);
+    cJSON_AddNumberToObject(root, "port", cfg.port);
+    cJSON_AddStringToObject(root, "user", cfg.username);
+    cJSON_AddStringToObject(root, "sub_topic", cfg.sub_topic);
+    cJSON_AddStringToObject(root, "pub_topic", cfg.pub_topic);
+    cJSON_AddBoolToObject(root, "use_tls", cfg.use_tls);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+    cJSON_free(json_str);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t mqtt_post_handler(httpd_req_t *req) {
+    if (req->content_len == 0 || req->content_len >= SAVE_REQ_MAX_LEN) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid data");
+        return ESP_FAIL;
+    }
+
+    char buf[SAVE_REQ_MAX_LEN];
+    size_t received = 0;
+    while (received < req->content_len) {
+        int ret = httpd_req_recv(req, buf + received, req->content_len - received);
+        if (ret <= 0) return ESP_FAIL;
+        received += ret;
+    }
+    buf[received] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    mqtt_config_t cfg;
+    mqtt_manager_get_config(&cfg);
+
+    cJSON *host_item = cJSON_GetObjectItem(root, "host");
+    cJSON *port_item = cJSON_GetObjectItem(root, "port");
+    cJSON *user_item = cJSON_GetObjectItem(root, "user");
+    cJSON *pass_item = cJSON_GetObjectItem(root, "pass");
+    cJSON *sub_item = cJSON_GetObjectItem(root, "sub_topic");
+    cJSON *pub_item = cJSON_GetObjectItem(root, "pub_topic");
+    cJSON *tls_item = cJSON_GetObjectItem(root, "use_tls");
+
+    if (cJSON_IsString(host_item) && strlen(host_item->valuestring) > 0) {
+        strncpy(cfg.broker_host, host_item->valuestring, sizeof(cfg.broker_host) - 1);
+    }
+    if (cJSON_IsNumber(port_item)) cfg.port = port_item->valueint;
+    if (cJSON_IsString(user_item)) strncpy(cfg.username, user_item->valuestring, sizeof(cfg.username) - 1);
+    if (cJSON_IsString(pass_item)) strncpy(cfg.password, pass_item->valuestring, sizeof(cfg.password) - 1);
+    if (cJSON_IsString(sub_item)) strncpy(cfg.sub_topic, sub_item->valuestring, sizeof(cfg.sub_topic) - 1);
+    if (cJSON_IsString(pub_item)) strncpy(cfg.pub_topic, pub_item->valuestring, sizeof(cfg.pub_topic) - 1);
+    if (cJSON_IsBool(tls_item)) cfg.use_tls = cJSON_IsTrue(tls_item);
+
+    mqtt_manager_set_config(&cfg);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"success\":true,\"message\":\"MQTT configuration updated\"}", HTTPD_RESP_USE_STRLEN);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
 esp_err_t web_server_start(void) {
     if (s_server != NULL) return ESP_OK;
 
@@ -233,6 +306,8 @@ esp_err_t web_server_start(void) {
     static const httpd_uri_t uri_scan = { .uri = "/api/scan", .method = HTTP_GET, .handler = scan_get_handler };
     static const httpd_uri_t uri_status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler };
     static const httpd_uri_t uri_save = { .uri = "/api/save", .method = HTTP_POST, .handler = save_post_handler };
+    static const httpd_uri_t uri_mqtt_get = { .uri = "/api/mqtt", .method = HTTP_GET, .handler = mqtt_get_handler };
+    static const httpd_uri_t uri_mqtt_post = { .uri = "/api/mqtt", .method = HTTP_POST, .handler = mqtt_post_handler };
 
     static const httpd_uri_t uri_gen204 = { .uri = "/generate_204", .method = HTTP_GET, .handler = captive_redirect_handler };
     static const httpd_uri_t uri_hotspot = { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_redirect_handler };
@@ -243,6 +318,8 @@ esp_err_t web_server_start(void) {
     httpd_register_uri_handler(s_server, &uri_scan);
     httpd_register_uri_handler(s_server, &uri_status);
     httpd_register_uri_handler(s_server, &uri_save);
+    httpd_register_uri_handler(s_server, &uri_mqtt_get);
+    httpd_register_uri_handler(s_server, &uri_mqtt_post);
     httpd_register_uri_handler(s_server, &uri_gen204);
     httpd_register_uri_handler(s_server, &uri_hotspot);
     httpd_register_uri_handler(s_server, &uri_ncsi);

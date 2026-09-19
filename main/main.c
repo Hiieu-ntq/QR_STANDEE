@@ -23,6 +23,8 @@
 #include "qrcodegen.h"
 #include "wifi_manager.h"
 #include "internet_check.h"
+#include "mqtt_manager.h"
+#include "json_parser.h"
 
 static const char *TAG = "F91_VNPT_FIRMWARE";
 
@@ -53,6 +55,7 @@ static esp_lcd_panel_handle_t panel_handle = NULL;
 static uint16_t *frame_buffer = NULL; // 15.3 KB DMA-capable Tile Buffer
 static uint16_t badge_buffer[68 * 24]; // Dedicated 3.2 KB buffer for countdown badge (stride 68)
 static SemaphoreHandle_t lcd_trans_sem = NULL;
+static SemaphoreHandle_t lcd_mutex = NULL;
 
 // Helper macro: Convert RGB to 16-bit i80 bus format (HighByte first, then LowByte)
 #define MAKE_COLOR(r, g, b) ({ \
@@ -88,15 +91,15 @@ static int raw_stream_display_timeout = 0;
 static bool has_custom_bg = false;
 static char current_qr_payload[512] = "https://vnpt.vn";
 
-// Forward declaration
-static void render_qr_payment_screen(const char *qr_data, int timeout_sec);
+// Forward declaration (Non-static so json_parser / mqtt_manager can render QR directly)
+void render_qr_payment_screen(const char *qr_data, int timeout_sec);
 
 // RAW STREAM mode tracking (10 tiles x 15360 bytes = 153600 bytes)
 static size_t stream_buf_offset = 0;
 static int stream_tile_index = 0;
 static bool stream_skip_whitespace = false;
 
-// Synchronous LCD Draw Bitmap using DMA Done ISR Semaphore
+// Synchronous LCD Draw Bitmap using DMA Done ISR Semaphore & Mutex
 static bool IRAM_ATTR lcd_on_trans_done(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx) {
     BaseType_t high_task_awoken = pdFALSE;
     if (lcd_trans_sem) {
@@ -106,10 +109,12 @@ static bool IRAM_ATTR lcd_on_trans_done(esp_lcd_panel_io_handle_t panel_io, esp_
 }
 
 static void draw_bitmap_sync(int x_start, int y_start, int x_end, int y_end, const void *color_data) {
+    if (lcd_mutex) xSemaphoreTake(lcd_mutex, portMAX_DELAY);
     esp_lcd_panel_draw_bitmap(panel_handle, x_start, y_start, x_end, y_end, color_data);
     if (lcd_trans_sem) {
         xSemaphoreTake(lcd_trans_sem, portMAX_DELAY);
     }
+    if (lcd_mutex) xSemaphoreGive(lcd_mutex);
 }
 
 // Ensure Internal DMA RAM tile buffer is allocated (15.3 KB)
@@ -437,7 +442,7 @@ static bool ensure_qr_buffers(void) {
 }
 
 // Generate & Render QR Code screen tile-by-tile to LCD using 15.3KB Tile Buffer
-static void render_qr_payment_screen(const char *qr_data, int timeout_sec) {
+void render_qr_payment_screen(const char *qr_data, int timeout_sec) {
     ESP_LOGI(TAG, "Rendering Payment QR Screen. Payload: %s, Timeout: %ds", qr_data, timeout_sec);
 
     if (!ensure_frame_buffer() || !ensure_qr_buffers()) return;
@@ -698,8 +703,22 @@ static void timer_task(void *pvParameters) {
 }
 
 // AT Command Parser
-static void process_at_command(const char *cmd) {
-    ESP_LOGI(TAG, "Received AT Command: [%s]", cmd);
+void process_at_command(const char *cmd) {
+    if (!cmd) return;
+    ESP_LOGI(TAG, "Received Serial Command: [%s]", cmd);
+
+    // Auto-detect JSON input
+    const char *tp = cmd;
+    while (*tp == ' ' || *tp == '\t' || *tp == '\r' || *tp == '\n') tp++;
+    if (*tp == '{' || *tp == '[') {
+        if (json_parser_process(tp)) {
+            printf("+JSON: OK\r\n");
+        } else {
+            printf("+JSON: ERROR\r\n");
+        }
+        fflush(stdout);
+        return;
+    }
 
     // Create uppercase version for case-insensitive matching
     char upper_cmd[512];
@@ -718,6 +737,9 @@ static void process_at_command(const char *cmd) {
     const char *wifi_ptr = strstr(upper_cmd, "AT+WIFI=");
     const char *wifistatus_ptr = strstr(upper_cmd, "AT+WIFISTATUS");
     const char *ping_ptr = strstr(upper_cmd, "AT+PING");
+    const char *mqttcfg_ptr = strstr(upper_cmd, "AT+MQTTCFG=");
+    const char *mqttstatus_ptr = strstr(upper_cmd, "AT+MQTTSTATUS");
+    const char *mqttpub_ptr = strstr(upper_cmd, "AT+MQTTPUB=");
 
     if (qr_ptr) {
         const char *orig_param = cmd + ((qr_ptr - upper_cmd) + 6);
@@ -886,6 +908,52 @@ static void process_at_command(const char *cmd) {
         fflush(stdout);
         wifi_manager_reset_to_ap_mode();
         printf("OK\r\n");
+        fflush(stdout);
+    }
+    else if (mqttcfg_ptr) {
+        const char *param = cmd + ((mqttcfg_ptr - upper_cmd) + 11);
+        mqtt_config_t cfg;
+        mqtt_manager_get_config(&cfg);
+
+        char host[128] = {0}, user[64] = {0}, pass[64] = {0}, sub[128] = {0};
+        int port = 8883;
+
+        if (sscanf(param, "\"%127[^\"]\",%d,\"%63[^\"]\",\"%63[^\"]\",\"%127[^\"]\"", host, &port, user, pass, sub) == 5 ||
+            sscanf(param, "%127[^,],%d,%63[^,],%63[^,],%127s", host, &port, user, pass, sub) == 5) {
+            strncpy(cfg.broker_host, host, sizeof(cfg.broker_host) - 1);
+            cfg.port = port;
+            strncpy(cfg.username, user, sizeof(cfg.username) - 1);
+            strncpy(cfg.password, pass, sizeof(cfg.password) - 1);
+            strncpy(cfg.sub_topic, sub, sizeof(cfg.sub_topic) - 1);
+            cfg.use_tls = (port == 8883 || port == 8884);
+            mqtt_manager_set_config(&cfg);
+            printf("+MQTTCFG: OK, Host=%s, Port=%d, SubTopic=%s\r\nOK\r\n", host, port, sub);
+        } else {
+            printf("+MQTTCFG: ERROR (INVALID_PARAMS)\r\n");
+        }
+        fflush(stdout);
+    }
+    else if (mqttstatus_ptr) {
+        mqtt_config_t cfg;
+        mqtt_manager_get_config(&cfg);
+        bool conn = mqtt_manager_is_connected();
+        printf("+MQTTSTATUS: %s, Host=%s, Port=%d, SubTopic=%s\r\nOK\r\n",
+               conn ? "CONNECTED" : "DISCONNECTED", cfg.broker_host, cfg.port, cfg.sub_topic);
+        fflush(stdout);
+    }
+    else if (mqttpub_ptr) {
+        const char *param = cmd + ((mqttpub_ptr - upper_cmd) + 11);
+        char topic[128] = {0}, msg[512] = {0};
+        if (sscanf(param, "\"%127[^\"]\",\"%511[^\"]\"", topic, msg) == 2 ||
+            sscanf(param, "%127[^,],%511s", topic, msg) == 2) {
+            if (mqtt_manager_publish(topic, msg)) {
+                printf("+MQTTPUB: OK\r\n");
+            } else {
+                printf("+MQTTPUB: ERROR (NOT_CONNECTED)\r\n");
+            }
+        } else {
+            printf("+MQTTPUB: ERROR (INVALID_PARAMS)\r\n");
+        }
         fflush(stdout);
     }
     else if (strstr(upper_cmd, "AT+RST") || strstr(upper_cmd, "AT+RESTART")) {
@@ -1072,6 +1140,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_i80(i80_bus, &io_config, &io_handle));
 
     lcd_trans_sem = xSemaphoreCreateBinary();
+    lcd_mutex = xSemaphoreCreateMutex();
     esp_lcd_panel_io_callbacks_t cbs = {
         .on_color_trans_done = lcd_on_trans_done,
     };
@@ -1108,6 +1177,9 @@ void app_main(void) {
 
     // 6. Initialize WiFi Manager & NVS WiFi credentials
     wifi_manager_init();
+
+    // Initialize MQTT Manager
+    mqtt_manager_init();
 
     // 7. Create Tasks
     xTaskCreate(usb_cdc_task, "usb_cdc_task", 8192, NULL, 5, NULL);
