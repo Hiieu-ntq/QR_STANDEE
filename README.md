@@ -50,7 +50,7 @@ graph TD
         DisplayEngine -->|Tốc độ cao 4MHz| LCD
     end
 
-    subgraph SETUP ["📱 KỸ THUẬT VIÊN / KHÁCH HÀNG"]
+    subgraph SETUP [" KHÁCH HÀNG"]
         Phone[Điện thoại di động]
         Phone -.->|Kết nối WiFi AP: ESP32_WiFi_Setup| WiFi
     end
