@@ -6,16 +6,16 @@ Firmware điều khiển hiển thị và giao tiếp cho thiết bị **F91 VNP
 
 ##  Tính Năng Nổi Bật
 
-* **Màn hình chờ thương hiệu VNPT HD**: Nền trắng tinh khiết chuẩn $240 \times 320$ pixel với logo VNPT sắc nét, không viền rác.
+* **Màn hình chờ thương hiệu VNPT HD**: Nền trắng chuẩn $240 \times 320$ pixel với logo VNPT sắc nét, không viền rác.
 * **Bộ sinh mã QR động Nayuki ISO/IEC 18004**: Tự động tạo mã QR chất lượng cao (ECC Quartile/Medium/Low) theo nội dung thanh toán gửi từ máy tính/POS, tích hợp logo VNPT ($36 \times 36$) ở tâm mã QR có **bo tròn 4 góc ($R=6\text{px}$)**.
 * **Thanh Hướng Dẫn Banner Xanh**: Dải màu xanh VNPT trên cùng hiển thị dòng chữ trắng hướng dẫn **`QUET MA DE THANH TOAN`**.
 * **Tích Hợp MQTT TLS Bảo Mật (HiveMQ Cloud Serverless)**:
   * Tự động kết nối bảo mật **MQTTS (Port 8883)** tới HiveMQ Cloud (`4a1375dbae154624a6759636e2559329.s1.eu.hivemq.cloud`).
   * Tự động đăng ký Topic nhận lệnh (`vnpt/f91/cmd`) và xuất báo cáo trạng thái (`vnpt/f91/status`).
   * Lưu trữ cấu hình HiveMQ vào NVS Flash và hỗ trợ thay đổi linh hoạt qua AT Command hoặc Web Config.
-* **Bộ Giải Mã Lệnh JSON Thông Minh (`cJSON`)**:
+* **Bộ Giải Mã Lệnh JSON (`cJSON`)**:
   * Tự động nhận diện và giải mã lệnh định dạng JSON gửi từ MQTT hoặc Serial CDC.
-* **Huy hiệu đếm ngược thời gian (Countdown Badge)**: Đếm lùi thời gian thực (30s, 29s, ..., 1s), tự động đóng mã QR và quay về màn hình chờ khi hết hạn.
+* ** đếm ngược thời gian (Countdown Badge)**: Đếm lùi thời gian thực (30s, 29s, ..., 1s), tự động đóng mã QR và quay về màn hình chờ khi hết hạn.
 * **Tích hợp Web Config & Captive Portal Tự Động**: 
   * Phát Wi-Fi SoftAP tên `ESP32_WiFi_Setup` (Mật khẩu: `12345678`).
   * Tự động nảy trang Web Cấu hình VNPT (`http://192.168.4.1`) hỗ trợ cài đặt cả Wi-Fi và HiveMQ Cloud.
@@ -24,26 +24,25 @@ Firmware điều khiển hiển thị và giao tiếp cho thiết bị **F91 VNP
 
 ---
 
-## 📐 Sơ Đồ Kiến Trúc & Luồng Hoạt Động Hệ Thống
+##  Sơ Đồ Kiến Trúc & Luồng Hoạt Động Hệ Thống
 
-### 🏗️ 1. Sơ Đồ Kiến Trúc Hệ Thống Tổng Thể (System Architecture)
+###  1. Sơ Đồ Kiến Trúc Hệ Thống Tổng Thể (System Architecture)
 
-> **Lời thuyết minh cho Sếp**: *"Dự án của mình gồm 3 phần chính kết nối khép kín: **Cloud Backend Server** quản lý giao dịch, **Mạng Cloud MQTT TLS** truyền lệnh bảo mật, và **Thiết bị F91 VNPT** xử lý hiển thị trực quan."*
 
 ```mermaid
 graph TD
-    subgraph CLOUD ["☁️ CLOUD BACKEND & SERVER"]
+    subgraph CLOUD [" CLOUD BACKEND & SERVER"]
         Server[VNPT Payment Backend / Web Admin]
         Broker[HiveMQ Cloud Serverless Broker<br/>MQTT over TLS - Cổng 8883]
         Server -->|Phát lệnh Thanh toán / Mã QR| Broker
     end
 
-    subgraph DEVICE ["📟 THIẾT BỊ STANDEE SMART F91 VNPT (ESP32-S2)"]
+    subgraph DEVICE [" THIẾT BỊ STANDEE SMART F91 VNPT (ESP32-S2)"]
         WiFi[WiFi & Cloud Module<br/>Xác thực TLS / Certificate Bundle]
         Parser[JSON Parser & Command Engine<br/>Giải mã lệnh tức thì]
         DisplayEngine[Bộ Render Màn hình Tile-DMA<br/>Ghép Logo VNPT & Mã VietQR]
         Flash[Bộ nhớ Flash NVS<br/>Lưu Tài khoản & Ảnh nền Custom]
-        LCD[🖥️ Màn hình LCD ST7789<br/>240x320 - 8-bit Parallel]
+        LCD[ Màn hình LCD ST7789<br/>240x320 - 8-bit Parallel]
 
         WiFi --> Parser
         Parser --> DisplayEngine
@@ -61,17 +60,16 @@ graph TD
 
 ---
 
-### 🔄 2. Sơ Đồ Luồng Thanh Toán VietQR Tự Động (QR Payment Flow)
+### 2. Sơ Đồ Luồng Thanh Toán VietQR Tự Động (QR Payment Flow)
 
-> **Lời thuyết minh cho Sếp**: *"Khi có giao dịch thanh toán, Server gửi lệnh qua MQTT. Thiết bị nhận dữ liệu, tự động tạo mã VietQR có đính Logo VNPT và đếm ngược thời gian thanh toán. Khi hết giờ, màn hình tự động quay về ảnh nền chờ."*
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant S as ☁️ Backend Server
-    participant M as 🛡️ MQTT Cloud Broker
-    participant D as 📟 Standee F91 VNPT
-    participant L as 🖥️ Màn hình LCD
+    participant S as  Backend Server
+    participant M as  MQTT Cloud Broker
+    participant D as  Standee F91 VNPT
+    participant L as  Màn hình LCD
 
     Note over D,L: Màn hình đang ở trạng thái CHỜ (Ảnh VNPT / Custom BG)
     S->>M: Gửi tin nhắn JSON (Mã QR, Số tiền, Timeout=30s)
@@ -90,17 +88,16 @@ sequenceDiagram
 
 ---
 
-### 🌐 3. Sơ Đồ Luồng Cấu Hình Mạng & Captive Portal (Smart Provisioning)
+### 3. Sơ Đồ Luồng Cấu Hình Mạng & Captive Portal (Smart Provisioning)
 
-> **Lời thuyết minh cho Sếp**: *"Điểm cải tiến thông minh là quy trình cài đặt. Khi mới bật máy hoặc đổi mạng, thiết bị phát Wi-Fi để cài đặt. Trang cài đặt chỉ đóng khi kỹ thuật viên nhập ĐỦ cả Wi-Fi VÀ Server MQTT, giúp thiết bị không bao giờ rơi vào trạng thái mất kết nối nửa chừng."*
 
 ```mermaid
 flowchart TD
-    A([🚀 Bật nguồn thiết bị F91]) --> B{Kiểm tra Bộ nhớ Flash NVS}
+    A([ Bật nguồn thiết bị F91]) --> B{Kiểm tra Bộ nhớ Flash NVS}
     
     B -- Đã có đủ Wi-Fi & MQTT --> C[Kết nối Wi-Fi & MQTT TLS Cloud]
     C --> D{Kết nối thành công?}
-    D -- Có --> E[🖥️ Hiển thị "MQTT CONNECTED" & Vào chế độ CHỜ]
+    D -- Có --> E[ Hiển thị "MQTT CONNECTED" & Vào chế độ CHỜ]
     D -- Thất bại --> F[Phát Wi-Fi Cấu hình: ESP32_WiFi_Setup]
 
     B -- Thiếu Wi-Fi HOẶC MQTT --> F
@@ -109,7 +106,7 @@ flowchart TD
     G --> H[Nhập SSID, Password Wi-Fi & Thông số MQTT Broker]
     H --> I{Kiểm tra dữ liệu nhập}
     I -- Đã nhập ĐỦ cả 2 --> J[Lưu vào Flash NVS & Đóng Wi-Fi AP & Khởi động lại]
-    I -- Thiếu 1 trong 2 --> K[⚠️ Cảnh báo trên Web: Bắt buộc nhập đủ Wi-Fi & MQTT]
+    I -- Thiếu 1 trong 2 --> K[ Cảnh báo trên Web: Bắt buộc nhập đủ Wi-Fi & MQTT]
     K --> G
     J --> C
 ```
@@ -215,5 +212,3 @@ Thiết bị sử dụng chip ESP32-S2 điều khiển màn hình ST7789 240x320
 
 ---
 
-## Giấy Phép (License)
-Phát triển bởi VNPT Standee Payment Firmware Team © 2026. Tất cả các quyền được bảo hộ.
