@@ -102,7 +102,7 @@ flowchart TD
 
     B -- "Thiếu Wi-Fi HOẶC MQTT" --> F
 
-    F --> G["📱 Người dùng dùng Điện thoại kết nối Wi-Fi & Mở trang Web Cấu hình"]
+    F --> G["Người dùng dùng Điện thoại kết nối Wi-Fi & Mở trang Web Cấu hình"]
     G --> H["Nhập SSID, Password Wi-Fi & Thông số MQTT Broker"]
     H --> I{"Kiểm tra dữ liệu nhập"}
     I -- "Đã nhập ĐỦ cả 2" --> J["Lưu vào Flash NVS & Đóng Wi-Fi AP & Khởi động lại"]
