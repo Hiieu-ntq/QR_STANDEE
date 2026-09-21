@@ -4,7 +4,7 @@ Firmware điều khiển hiển thị và giao tiếp cho thiết bị **F91 VNP
 
 ---
 
-## 🌟 Tính Năng Nổi Bật
+##  Tính Năng Nổi Bật
 
 * **Màn hình chờ thương hiệu VNPT HD**: Nền trắng tinh khiết chuẩn $240 \times 320$ pixel với logo VNPT sắc nét, không viền rác.
 * **Bộ sinh mã QR động Nayuki ISO/IEC 18004**: Tự động tạo mã QR chất lượng cao (ECC Quartile/Medium/Low) theo nội dung thanh toán gửi từ máy tính/POS, tích hợp logo VNPT ($36 \times 36$) ở tâm mã QR có **bo tròn 4 góc ($R=6\text{px}$)**.
@@ -25,7 +25,7 @@ Firmware điều khiển hiển thị và giao tiếp cho thiết bị **F91 VNP
 
 ---
 
-## 📋 Bảng Tập Lệnh Serial AT Commands Chi Tiết
+## Bảng Tập Lệnh Serial AT Commands Chi Tiết
 
 Mọi lệnh AT được gửi qua cổng USB Serial CDC (Baudrate: `115200`, kết thúc bằng `\r\n` hoặc `\n`).
 
@@ -49,7 +49,7 @@ Mọi lệnh AT được gửi qua cổng USB Serial CDC (Baudrate: `115200`, k�
 
 ---
 
-## 📦 Định Dạng Chuỗi Lệnh JSON (JSON Command Parser)
+## Định Dạng Chuỗi Lệnh JSON (JSON Command Parser)
 
 Thiết bị tự động giải mã các gói tin JSON gửi qua MQTT Topic `vnpt/f91/cmd` hoặc truyền qua Serial CDC:
 
@@ -97,7 +97,7 @@ Thiết bị sẽ tự động phản hồi dữ liệu JSON lên Topic `vnpt/f9
 
 ---
 
-## 🔌 Sơ Đồ Chân Phần Cứng (Hardware Pinout)
+## Sơ Đồ Chân Phần Cứng (Hardware Pinout)
 
 Thiết bị sử dụng chip ESP32-S2 điều khiển màn hình ST7789 240x320 qua bus vi xử lý 8-bit Intel 8080:
 
@@ -124,5 +124,5 @@ Thiết bị sử dụng chip ESP32-S2 điều khiển màn hình ST7789 240x320
 
 ---
 
-## 📄 Giấy Phép (License)
+## Giấy Phép (License)
 Phát triển bởi VNPT Standee Payment Firmware Team © 2026. Tất cả các quyền được bảo hộ.
