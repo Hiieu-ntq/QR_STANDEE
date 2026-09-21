@@ -93,20 +93,20 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A([ Bật nguồn thiết bị F91]) --> B{Kiểm tra Bộ nhớ Flash NVS}
+    A(["Bật nguồn thiết bị F91"]) --> B{"Kiểm tra Bộ nhớ Flash NVS"}
     
-    B -- Đã có đủ Wi-Fi & MQTT --> C[Kết nối Wi-Fi & MQTT TLS Cloud]
-    C --> D{Kết nối thành công?}
-    D -- Có --> E[ Hiển thị "MQTT CONNECTED" & Vào chế độ CHỜ]
-    D -- Thất bại --> F[Phát Wi-Fi Cấu hình: ESP32_WiFi_Setup]
+    B -- "Đã có đủ Wi-Fi & MQTT" --> C["Kết nối Wi-Fi & MQTT TLS Cloud"]
+    C --> D{"Kết nối thành công?"}
+    D -- "Có" --> E["Hiển thị 'MQTT CONNECTED' & Vào chế độ CHỜ"]
+    D -- "Thất bại" --> F["Phát Wi-Fi Cấu hình: ESP32_WiFi_Setup"]
 
-    B -- Thiếu Wi-Fi HOẶC MQTT --> F
+    B -- "Thiếu Wi-Fi HOẶC MQTT" --> F
 
-    F --> G[📱 Người dùng dùng Điện thoại kết nối Wi-Fi & Mở trang Web Cấu hình]
-    G --> H[Nhập SSID, Password Wi-Fi & Thông số MQTT Broker]
-    H --> I{Kiểm tra dữ liệu nhập}
-    I -- Đã nhập ĐỦ cả 2 --> J[Lưu vào Flash NVS & Đóng Wi-Fi AP & Khởi động lại]
-    I -- Thiếu 1 trong 2 --> K[ Cảnh báo trên Web: Bắt buộc nhập đủ Wi-Fi & MQTT]
+    F --> G["📱 Người dùng dùng Điện thoại kết nối Wi-Fi & Mở trang Web Cấu hình"]
+    G --> H["Nhập SSID, Password Wi-Fi & Thông số MQTT Broker"]
+    H --> I{"Kiểm tra dữ liệu nhập"}
+    I -- "Đã nhập ĐỦ cả 2" --> J["Lưu vào Flash NVS & Đóng Wi-Fi AP & Khởi động lại"]
+    I -- "Thiếu 1 trong 2" --> K["Cảnh báo trên Web: Bắt buộc nhập đủ Wi-Fi & MQTT"]
     K --> G
     J --> C
 ```
